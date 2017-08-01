@@ -5,5 +5,8 @@ New features:
 
 Enhancements:
 
-Bug fixes and maintenance updates:
+- Cloud Spanner: Added --cloud_spanner_instance and --cloud_spanner_database to
+  separate instance lifecycle from perfkit resource lifecycle. This allows
+  reusing instances and databases for benchmark. (GH-1461)
 
+Bug fixes and maintenance updates:
