@@ -14,6 +14,9 @@
   - Add new location, `us/ewr`
 - Add aws_image_name_filter flag to ease specifying images.
 - Add c5/m5 support for NVME disks.
+- Cloud Spanner: Added --cloud_spanner_instance and --cloud_spanner_database to
+  separate instance lifecycle from perfkit resource lifecycle. This allows
+  reusing instances and databases for benchmark. (GH-1461)
 
 ###Bug fixes and maintenance updates:
 - Moved GPU-related specs from GceVmSpec to BaseVmSpec

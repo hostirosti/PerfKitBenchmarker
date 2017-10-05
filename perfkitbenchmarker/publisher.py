@@ -193,6 +193,9 @@ class DefaultMetadataProvider(MetadataProvider):
       for k, v in cloud_tpu.GetResourceMetadata().iteritems():
         metadata['cloud_tpu_' + k] = v
 
+    if benchmark_spec.metadata:
+      metadata.update(benchmark_spec.metadata)
+
     for name, vms in benchmark_spec.vm_groups.iteritems():
       if len(vms) == 0:
         continue
@@ -203,6 +206,10 @@ class DefaultMetadataProvider(MetadataProvider):
       for k, v in vm.GetResourceMetadata().iteritems():
         metadata[name_prefix + k] = v
       metadata[name_prefix + 'vm_count'] = len(vms)
+      # Accommodate for multi-zone provisioning of VMs
+      if FLAGS.zones or FLAGS.extra_zones:
+        zone_list = FLAGS.zones + FLAGS.extra_zones
+        metadata[name_prefix + 'zone'] = ",".join(zone_list)
 
       if vm.scratch_disks:
         data_disk = vm.scratch_disks[0]
@@ -301,7 +308,7 @@ class PrettyPrintStreamPublisher(SamplePublisher):
       End to End Runtime        444.33 seconds
 
     -------------------------
-    For all tests: cloud="GCP" image="ubuntu-14-04" machine_type="n1-standa ...
+    For all tests: cloud="GCP" image="ubuntu-16-04" machine_type="n1-standa ...
 
   Attributes:
     stream: File-like object. Output stream to print samples.
