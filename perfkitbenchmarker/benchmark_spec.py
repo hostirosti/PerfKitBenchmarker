@@ -116,6 +116,8 @@ class BenchmarkSpec(object):
     self.container_cluster = None
     self.managed_relational_db = None
     self.cloud_tpu = None
+    self.metadata = None
+    self.exec_uri = None
 
     self._zone_index = 0
 

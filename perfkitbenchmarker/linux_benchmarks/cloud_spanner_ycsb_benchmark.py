@@ -139,14 +139,13 @@ def Prepare(benchmark_spec):
       description=BENCHMARK_DESCRIPTION,
       database=FLAGS.cloud_spanner_database,
       ddl=BENCHMARK_SCHEMA)
-  if (not FLAGS.cloud_spanner_instance
+  if (FLAGS.ycsb_reload_database
       and benchmark_spec.spanner_instance._Exists(instance_only=True)):
     logging.warning('Cloud Spanner instance %s exists, delete it first.' %
                     _GetInstanceName())
     benchmark_spec.spanner_instance.Delete()
   benchmark_spec.spanner_instance.Create()
-  if (not FLAGS.cloud_spanner_instance
-      and not benchmark_spec.spanner_instance._Exists()):
+  if (not benchmark_spec.spanner_instance._Exists()):
     logging.warning('Failed to create Cloud Spanner instance and database.')
     benchmark_spec.spanner_instance.Delete()
 
@@ -169,7 +168,16 @@ def Prepare(benchmark_spec):
   # Restore YCSB_TAR_URL
   ycsb.YCSB_TAR_URL = default_ycsb_tar_url
   benchmark_spec.executor = ycsb.YCSBExecutor('cloudspanner')
-
+  metadata = {
+      'cloudspanner.project': FLAGS.cloud_spanner_project,
+      'cloudspanner.nodes': FLAGS.cloud_spanner_nodes,
+      'cloudspanner.config': FLAGS.cloud_spanner_config,
+  }
+  # Add metadata
+  if benchmark_spec.metadata:
+    benchmark_spec.update(metadata)
+  else:
+    benchmark_spec.metadata = metadata
 
 def Run(benchmark_spec):
   """Spawn YCSB and gather the results.

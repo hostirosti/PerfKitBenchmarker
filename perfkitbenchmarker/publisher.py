@@ -173,6 +173,7 @@ class DefaultMetadataProvider(MetadataProvider):
   def AddMetadata(self, metadata, benchmark_spec):
     metadata = metadata.copy()
     metadata['perfkitbenchmarker_version'] = version.VERSION
+    metadata['exec_uri'] = benchmark_spec.exec_uri
     if FLAGS.simulate_maintenance:
       metadata['simulate_maintenance'] = True
     if FLAGS.hostname_metadata:
@@ -192,6 +193,9 @@ class DefaultMetadataProvider(MetadataProvider):
       cloud_tpu = benchmark_spec.cloud_tpu
       for k, v in cloud_tpu.GetResourceMetadata().iteritems():
         metadata['cloud_tpu_' + k] = v
+    
+    if benchmark_spec.metadata:
+      metadata.update(benchmark_spec.metadata)
 
     for name, vms in benchmark_spec.vm_groups.iteritems():
       if len(vms) == 0:

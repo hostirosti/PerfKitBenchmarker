@@ -388,6 +388,10 @@ def _CreateBenchmarkSpecs():
     specs.append(benchmark_spec.BenchmarkSpec.GetBenchmarkSpec(
         benchmark_module, config, uid))
 
+  # Add unique exec_uri for each pkb run to all benchmark specs
+  for bs in specs:
+    bs.exec_uri = str(uuid.uuid4())
+
   return specs
 
 

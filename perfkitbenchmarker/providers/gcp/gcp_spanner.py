@@ -70,6 +70,7 @@ class GcpSpannerInstance(resource.BaseResource):
 
     # Cloud Spanner may not explicitly set the following common flags.
     self.project = FLAGS.cloud_spanner_project or util.GetDefaultProject()
+
     self.zone = None
 
   def _Create(self):
