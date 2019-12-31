@@ -19,6 +19,9 @@
 image-classification).
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import re
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import flags
@@ -26,6 +29,7 @@ from perfkitbenchmarker import sample
 from perfkitbenchmarker.linux_packages import cuda_toolkit
 from perfkitbenchmarker.linux_packages import mxnet
 from perfkitbenchmarker.linux_packages import mxnet_cnn
+from six.moves import range
 
 
 FLAGS = flags.FLAGS
@@ -53,7 +57,6 @@ mxnet:
 
 GPU = 'gpu'
 CPU = 'cpu'
-IMAGENET_SHAPE = '3,299,299'
 
 MODELS = ['alexnet', 'googlenet', 'inception-bn', 'inception-resnet-v2',
           'inception-v3', 'inception-v4', 'lenet', 'mlp', 'mobilenet',
@@ -71,6 +74,13 @@ flags.DEFINE_enum('mx_device', GPU, [CPU, GPU],
                   'Device to use for computation: cpu or gpu')
 flags.DEFINE_integer('mx_num_layers', None, 'Number of layers in the neural '
                      'network, required by some networks such as resnet')
+flags.DEFINE_enum('mx_precision', 'float32', ['float16', 'float32'],
+                  'Precision')
+flags.DEFINE_enum('mx_key_value_store', 'device',
+                  ['local', 'device', 'nccl', 'dist_sync', 'dist_device_sync',
+                   'dist_async'], 'Key-Value store types.')
+flags.DEFINE_string('mx_image_shape', None,
+                    'The image shape that feeds into the network.')
 
 DEFAULT_BATCH_SIZE = 64
 DEFAULT = 'default'
@@ -89,6 +99,25 @@ DEFAULT_BATCH_SIZES_BY_MODEL = {
 DEFAULT_NUM_LAYERS_BY_MODEL = {
     'vgg': 16,
     'resnet': 50
+}
+
+INCEPTION3_IMAGE_SHAPE = '3,299,299'
+MNIST_IMAGE_SHAPE = '1,28,28'
+IMAGENET_IMAGE_SHAPE = '3,224,224'
+
+DEFAULT_IMAGE_SHAPE_BY_MODEL = {
+    'inception-v3': INCEPTION3_IMAGE_SHAPE,
+    'inception-v4': INCEPTION3_IMAGE_SHAPE,
+    'inception-bn': IMAGENET_IMAGE_SHAPE,
+    'inception-resnet-v2': IMAGENET_IMAGE_SHAPE,
+    'alexnet': IMAGENET_IMAGE_SHAPE,
+    'googlenet': IMAGENET_IMAGE_SHAPE,
+    'mobilenet': IMAGENET_IMAGE_SHAPE,
+    'resnet-v1': IMAGENET_IMAGE_SHAPE,
+    'resnet': IMAGENET_IMAGE_SHAPE,
+    'resnext': IMAGENET_IMAGE_SHAPE,
+    'vgg': IMAGENET_IMAGE_SHAPE,
+    'lenet': MNIST_IMAGE_SHAPE
 }
 
 
@@ -114,7 +143,15 @@ def _GetDefaultBatchSize(model, num_layers=None):
 
 
 def _GetBatchSize(model, num_layers=None):
-  return FLAGS.tf_batch_size or _GetDefaultBatchSize(model, num_layers)
+  return FLAGS.mx_batch_size or _GetDefaultBatchSize(model, num_layers)
+
+
+def _GetDefaultImageShape(model):
+  return DEFAULT_IMAGE_SHAPE_BY_MODEL.get(model, IMAGENET_IMAGE_SHAPE)
+
+
+def _GetImageShape(model):
+  return FLAGS.mx_image_shape or _GetDefaultImageShape(model)
 
 
 def _GetDefaultNumLayersByModel(model):
@@ -136,6 +173,8 @@ def _UpdateBenchmarkSpecWithFlags(benchmark_spec):
   benchmark_spec.num_epochs = FLAGS.mx_num_epochs
   benchmark_spec.device = FLAGS.mx_device
   benchmark_spec.num_layers = FLAGS.mx_num_layers
+  benchmark_spec.precision = FLAGS.mx_precision
+  benchmark_spec.key_value_store = FLAGS.mx_key_value_store
 
 
 def Prepare(benchmark_spec):
@@ -161,16 +200,20 @@ def _CreateMetadataDict(benchmark_spec):
     metadata dict
   """
   vm = benchmark_spec.vms[0]
-  metadata = dict()
+  metadata = {
+      'batch_size': benchmark_spec.batch_size,
+      'num_epochs': benchmark_spec.num_epochs,
+      'device': benchmark_spec.device,
+      'num_layers': benchmark_spec.num_layers,
+      'model': benchmark_spec.model,
+      'mxnet_version': benchmark_spec.mxnet_version,
+      'precision': benchmark_spec.precision,
+      'key_value_store': benchmark_spec.key_value_store,
+      'image_shape': benchmark_spec.image_shape,
+      'commit': mxnet_cnn.GetCommit(vm)
+  }
   if benchmark_spec.device == GPU:
     metadata.update(cuda_toolkit.GetMetadata(vm))
-  metadata['batch_size'] = benchmark_spec.batch_size
-  metadata['num_epochs'] = benchmark_spec.num_epochs
-  metadata['device'] = benchmark_spec.device
-  metadata['num_layers'] = benchmark_spec.num_layers
-  metadata['model'] = benchmark_spec.model
-  metadata['mxnet_version'] = benchmark_spec.mxnet_version
-  metadata['commit'] = mxnet_cnn.GetCommit(vm)
   return metadata
 
 
@@ -178,8 +221,8 @@ def _ExtractThroughput(output):
   """Extract throughput from MXNet output.
 
   Sample output:
-  INFO:root:Epoch[0] Batch [460]	Speed: 50.42 samples/sec	accuracy=1.000000
-  INFO:root:Epoch[0] Batch [480]	Speed: 50.47 samples/sec	accuracy=1.000000
+  INFO:root:Epoch[0] Batch [460-480] Speed: 50.42 samples/sec accuracy=1.000000
+  INFO:root:Epoch[0] Batch [480-500] Speed: 50.47 samples/sec accuracy=1.000000
   INFO:root:Epoch[0] Train-accuracy=1.000000
   INFO:root:Epoch[0] Time cost=634.243
 
@@ -189,7 +232,7 @@ def _ExtractThroughput(output):
   Returns:
     throughput (float)
   """
-  regex = r'Batch\s+\[\d+\]\tSpeed:\s+(\d+.\d+)\s+'
+  regex = r'Speed:\s+(\d+.\d+)'
   match = re.findall(regex, output)
   try:
     return sum(float(step) for step in match) / len(match)
@@ -233,18 +276,35 @@ def Run(benchmark_spec):
     benchmark_spec.model = model
     benchmark_spec.batch_size = batch_size
     benchmark_spec.num_layers = num_layers
+    benchmark_spec.image_shape = _GetImageShape(model)
     mx_benchmark_cmd = (
-        'python train_imagenet.py --benchmark 1 --network %s --batch-size %s '
-        '--image-shape %s --num-epochs %s --kv-store device') % (
-            model,
-            batch_size,
-            IMAGENET_SHAPE,
-            benchmark_spec.num_epochs)
+        'python train_imagenet.py '
+        '--benchmark=1 '
+        '--network={network} '
+        '--batch-size={batch_size} '
+        '--image-shape={image_shape} '
+        '--num-epochs={num_epochs} '
+        '--dtype={precision} '
+        '--kv-store={key_value_store}').format(
+            network=model,
+            batch_size=batch_size,
+            image_shape=benchmark_spec.image_shape,
+            num_epochs=benchmark_spec.num_epochs,
+            precision=benchmark_spec.precision,
+            key_value_store=benchmark_spec.key_value_store)
     if benchmark_spec.device == GPU:
-      gpus = cuda_toolkit.QueryNumberOfGpus(vm)
-      mx_benchmark_cmd = '%s %s --gpus %s' % (
-          mxnet.GetEnvironmentVars(vm), mx_benchmark_cmd,
-          ','.join(str(n) for n in range(gpus)))
+      num_gpus = cuda_toolkit.QueryNumberOfGpus(vm)
+      mx_benchmark_cmd = '{env} {cmd} --gpus {gpus}'.format(
+          env=mxnet.GetEnvironmentVars(vm),
+          cmd=mx_benchmark_cmd,
+          gpus=','.join(str(n) for n in range(num_gpus)))
+    elif benchmark_spec.device == CPU:
+      # Specifies the number of threads to use in CPU test.
+      # https://mxnet.incubator.apache.org/faq/perf.html
+      mx_benchmark_cmd = 'OMP_NUM_THREADS={omp_num_threads} {cmd}'.format(
+          omp_num_threads=vm.NumCpusForBenchmark() // 2,
+          cmd=mx_benchmark_cmd)
+
     if num_layers:
       mx_benchmark_cmd = '%s --num-layers %s' % (mx_benchmark_cmd, num_layers)
     run_command = 'cd %s && %s' % (mx_benchmark_dir,

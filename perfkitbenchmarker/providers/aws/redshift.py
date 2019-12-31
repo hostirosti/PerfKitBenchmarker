@@ -18,39 +18,39 @@ and deleted.
 """
 
 import json
-import util
+import os
 
+from perfkitbenchmarker import data
 from perfkitbenchmarker import edw_service
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import vm_util
-
+from perfkitbenchmarker.providers.aws import aws_cluster_parameter_group
+from perfkitbenchmarker.providers.aws import aws_cluster_subnet_group
+from perfkitbenchmarker.providers.aws import util
 
 FLAGS = flags.FLAGS
-
 
 VALID_EXIST_STATUSES = ['creating', 'available']
 DELETION_STATUSES = ['deleting']
 READY_STATUSES = ['available']
+ELIMINATE_AUTOMATED_SNAPSHOT_RETENTION = '--automated-snapshot-retention-period=0'
+DEFAULT_DATABASE_NAME = 'dev'
+BOOTSTRAP_DB = 'sample'
 
 
-def AddTags(resource_arn, region, **kwargs):
+def AddTags(resource_arn, region):
   """Adds tags to a Redshift cluster created by PerfKitBenchmarker.
 
   Args:
     resource_arn: The arn of AWS resource to operate on.
     region: The AWS region resource was created in.
-    **kwargs: dict. Key-value pairs to set on the instance.
   """
-
-  if not kwargs:
-    return
   cmd_prefix = util.AWS_PREFIX
   tag_cmd = cmd_prefix + ['redshift', 'create-tags', '--region=%s' % region,
                           '--resource-name', resource_arn, '--tags']
-  for key, value in kwargs.iteritems():
-    tag_cmd.append('Key={0},Value={1}'.format(key, value))
+  tag_cmd += util.MakeFormattedDefaultTags()
   vm_util.IssueCommand(tag_cmd)
 
 
@@ -60,88 +60,6 @@ def GetDefaultRegion():
   default_region_cmd = cmd_prefix + ['configure', 'get', 'region']
   stdout, _, _ = vm_util.IssueCommand(default_region_cmd)
   return stdout
-
-
-class RedshiftClusterSubnetGroup(object):
-  """Cluster Subnet Group associated with a Redshift cluster launched in a vpc.
-
-  A cluster subnet group allows you to specify a set of subnets in your VPC.
-
-
-  Attributes:
-    name: A string name of the cluster subnet group.
-    subnet_id: A string name of the subnet id associated with the group.
-  """
-
-  def __init__(self, subnet_id, cmd_prefix):
-    self.cmd_prefix = cmd_prefix
-    self.name = 'pkb-' + FLAGS.run_uri
-    self.subnet_id = subnet_id
-    cmd = self.cmd_prefix + ['redshift',
-                             'create-cluster-subnet-group',
-                             '--cluster-subnet-group-name',
-                             self.name,
-                             '--description',
-                             'Cluster Subnet Group for run uri {}'
-                             .format(FLAGS.run_uri),
-                             '--subnet-ids',
-                             self.subnet_id]
-    vm_util.IssueCommand(cmd)
-
-  def _Delete(self):
-    """Delete a redshift cluster subnet group."""
-    cmd = self.cmd_prefix + ['redshift',
-                             'delete-cluster-subnet-group',
-                             '--cluster-subnet-group-name',
-                             self.name]
-    vm_util.IssueCommand(cmd)
-
-
-class RedshiftClusterParameterGroup(object):
-  """Cluster Paramemter Group associated with a Redshift cluster.
-
-  A cluster parameter group allows you to specify concurrency for the cluster.
-
-
-  Attributes:
-    name: A string name of the cluster parameter group.
-    concurrency: An integer concurrency value for the cluster.
-  """
-
-  def __init__(self, concurrency, cmd_prefix):
-    self.cmd_prefix = cmd_prefix
-    self.name = 'pkb-' + FLAGS.run_uri
-    cmd = self.cmd_prefix + ['redshift',
-                             'create-cluster-parameter-group',
-                             '--parameter-group-name',
-                             self.name,
-                             '--parameter-group-family',
-                             'redshift-1.0',
-                             '--description',
-                             'Cluster Parameter group for run uri {}'
-                             .format(FLAGS.run_uri)]
-    vm_util.IssueCommand(cmd)
-    wlm_concurrency_parameter_prefix = ('[{"ParameterName":"wlm_json_configurat'
-                                        'ion","ParameterValue":"[{\\\"query_con'
-                                        'currency\\\":')
-    wlm_concurrency_parameter_postfix = '}]","ApplyType":"dynamic"}]'
-    cmd = self.cmd_prefix + ['redshift',
-                             'modify-cluster-parameter-group',
-                             '--parameter-group-name',
-                             self.name,
-                             '--parameters',
-                             '{}{}{}'.format(wlm_concurrency_parameter_prefix,
-                                             str(concurrency),
-                                             wlm_concurrency_parameter_postfix)]
-    vm_util.IssueCommand(cmd)
-
-  def _Delete(self):
-    """Delete a redshift cluster parameter group."""
-    cmd = self.cmd_prefix + ['redshift',
-                             'delete-cluster-parameter-group',
-                             '--parameter-group-name',
-                             self.name]
-    vm_util.IssueCommand(cmd)
 
 
 class Redshift(edw_service.EdwService):
@@ -155,11 +73,13 @@ class Redshift(edw_service.EdwService):
   CLOUD = providers.AWS
   SERVICE_TYPE = 'redshift'
 
+  READY_TIMEOUT = 7200
+
   def __init__(self, edw_service_spec):
     super(Redshift, self).__init__(edw_service_spec)
     # pkb setup attribute
     self.project = None
-    self.cmd_prefix = util.AWS_PREFIX
+    self.cmd_prefix = list(util.AWS_PREFIX)
     if FLAGS.zones:
       self.zone = FLAGS.zones[0]
       self.region = util.GetRegionFromZone(self.zone)
@@ -171,18 +91,87 @@ class Redshift(edw_service.EdwService):
     self.cluster_subnet_group = None
     self.cluster_parameter_group = None
     self.arn = ''
+    self.cluster_subnet_group = aws_cluster_subnet_group.RedshiftClusterSubnetGroup(
+        self.cmd_prefix)
+    self.cluster_parameter_group = aws_cluster_parameter_group.RedshiftClusterParameterGroup(
+        edw_service_spec.concurrency, self.cmd_prefix)
+
+    if self.db is None:
+      self.db = DEFAULT_DATABASE_NAME
+
+  def _CreateDependencies(self):
+    self.cluster_subnet_group.Create()
+    self.cluster_parameter_group.Create()
 
   def _Create(self):
     """Create the redshift cluster resource."""
-    self.cluster_subnet_group = RedshiftClusterSubnetGroup(self.spec.subnet_id,
-                                                           self.cmd_prefix)
-    self.cluster_parameter_group = RedshiftClusterParameterGroup(
-        self.concurrency, self.cmd_prefix)
     if self.snapshot:
       self.Restore(self.snapshot, self.cluster_identifier)
     else:
-      # TODO(saksena@): Implmement the new Redshift cluster creation
-      raise NotImplementedError()
+      self.Initialize(self.cluster_identifier, self.node_type, self.node_count,
+                      self.user, self.password, self.cluster_parameter_group,
+                      self.cluster_subnet_group)
+
+  def Initialize(self, cluster_identifier, node_type, node_count, user,
+                 password, cluster_parameter_group, cluster_subnet_group):
+    """Method to initialize a Redshift cluster from an configuration parameters.
+
+    The cluster is initialized in the EC2-VPC platform, that runs it in a
+    virtual private cloud (VPC). This allows control access to the cluster by
+    associating one or more VPC security groups with the cluster.
+
+    To create a cluster in a VPC, first create an Amazon Redshift cluster subnet
+    group by providing subnet information of the VPC, and then provide the
+    subnet group when launching the cluster.
+
+
+    Args:
+      cluster_identifier: A unique identifier for the cluster.
+      node_type: The node type to be provisioned for the cluster.
+       Valid Values: ds2.xlarge | ds2.8xlarge | ds2.xlarge | ds2.8xlarge |
+         dc1.large | dc1.8xlarge | dc2.large | dc2.8xlarge
+      node_count: The number of compute nodes in the cluster.
+      user: The user name associated with the master user account for the
+        cluster that is being created.
+      password: The password associated with the master user account for the
+        cluster that is being created.
+      cluster_parameter_group: Cluster Parameter Group associated with the
+        cluster.
+      cluster_subnet_group: Cluster Subnet Group associated with the cluster.
+
+    Returns:
+      None
+
+
+    Raises:
+      MissingOption: If any of the required parameters is missing.
+    """
+    if not (cluster_identifier and node_type and user and password):
+      raise errors.MissingOption('Need cluster_identifier, user and password '
+                                 'set for creating a cluster.')
+
+    prefix = [
+        'redshift', 'create-cluster', '--cluster-identifier', cluster_identifier
+    ]
+
+    if node_count == 1:
+      worker_count_cmd = ['--cluster-type', 'single-node']
+    else:
+      worker_count_cmd = ['--number-of-nodes', str(node_count)]
+
+    postfix = [
+        '--node-type', node_type, '--master-username', user,
+        '--master-user-password', password, '--cluster-parameter-group-name',
+        cluster_parameter_group.name, '--cluster-subnet-group-name',
+        cluster_subnet_group.name, '--publicly-accessible',
+        ELIMINATE_AUTOMATED_SNAPSHOT_RETENTION
+    ]
+
+    cmd = self.cmd_prefix + prefix + worker_count_cmd + postfix
+    stdout, stderr, _ = vm_util.IssueCommand(cmd, raise_on_failure=False)
+    if not stdout:
+      raise errors.Resource.CreationError('Cluster creation failure: '
+                                          '{}'.format(stderr))
 
   def _ValidateSnapshot(self, snapshot_identifier):
     """Validate the presence of a cluster snapshot based on its metadata."""
@@ -243,7 +232,7 @@ class Redshift(edw_service.EdwService):
                                '--cluster-subnet-group-name',
                                self.cluster_subnet_group.name,
                                '--cluster-parameter-group-name',
-                               self.cluster_subnet_group.name,
+                               self.cluster_parameter_group.name,
                                '--publicly-accessible',
                                '--automated-snapshot-retention-period=0']
       stdout, stderr, _ = vm_util.IssueCommand(cmd)
@@ -255,7 +244,7 @@ class Redshift(edw_service.EdwService):
     """Describe a redshift cluster."""
     cmd = self.cmd_prefix + ['redshift', 'describe-clusters',
                              '--cluster-identifier', self.cluster_identifier]
-    return vm_util.IssueCommand(cmd)
+    return vm_util.IssueCommand(cmd, raise_on_failure=False)
 
   def _Exists(self):
     """Method to validate the existence of a redshift cluster.
@@ -294,15 +283,14 @@ class Redshift(edw_service.EdwService):
     self.arn = 'arn:aws:redshift:{}:{}:cluster:{}'.format(self.region, account,
                                                           self.
                                                           cluster_identifier)
-    tags = {'owner': FLAGS.owner, 'perfkitbenchmarker-run': FLAGS.run_uri}
-    AddTags(self.arn, self.region, **tags)
+    AddTags(self.arn, self.region)
 
   def _Delete(self):
     """Delete a redshift cluster and disallow creation of a snapshot."""
     cmd = self.cmd_prefix + ['redshift', 'delete-cluster',
                              '--cluster-identifier', self.cluster_identifier,
                              '--skip-final-cluster-snapshot']
-    vm_util.IssueCommand(cmd)
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
 
   def _IsDeleting(self):
     """Method to check if the cluster is being deleting."""
@@ -315,8 +303,8 @@ class Redshift(edw_service.EdwService):
 
   def _DeleteDependencies(self):
     """Delete dependencies of a redshift cluster."""
-    self.cluster_subnet_group._Delete()
-    self.cluster_parameter_group._Delete()
+    self.cluster_subnet_group.Delete()
+    self.cluster_parameter_group.Delete()
 
   def GetMetadata(self):
     """Return a dictionary of the metadata for this cluster."""
@@ -326,3 +314,71 @@ class Redshift(edw_service.EdwService):
     if self.snapshot is not None:
       basic_data['snapshot'] = self.snapshot
     return basic_data
+
+  def RunCommandHelper(self):
+    """Redshift specific run script command components."""
+    return '--host={} --database={} --user={} --password={}'.format(
+        self.endpoint, self.db, self.user, self.password)
+
+  def InstallAndAuthenticateRunner(self, vm):
+    """Method to perform installation and authentication of redshift runner.
+
+    psql, a terminal-based front end from PostgreSQL, used as client
+    https://docs.aws.amazon.com/redshift/latest/mgmt/connecting-from-psql.html
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    vm.Install('pgbench')
+
+  def PrepareClientVm(self, vm):
+    """Prepare phase to install the runtime environment on the client vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    super(Redshift, self).PrepareClientVm(vm)
+    self.InstallAndAuthenticateRunner(vm)
+
+  def PushDataDefinitionDataManipulationScripts(self, vm):
+    """Prepare phase to install the runtime environment on the client vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    service_specific_dir = os.path.join('edw', self.SERVICE_TYPE)
+    use_case_specific_dir = os.path.join(service_specific_dir, BOOTSTRAP_DB)
+    bootstrap_script_list = ['database_%s.sql' % x
+                             for x in edw_service.EDW_SERVICE_LIFECYCLE_STAGES]
+    for script in bootstrap_script_list:
+      create_script_path = os.path.join(use_case_specific_dir, script)
+      vm.PushFile(data.ResourcePath(create_script_path))
+
+  def PushScriptExecutionFramework(self, vm):
+    """Prepare phase to install the runtime environment on the client vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    super(Redshift, self).PushScriptExecutionFramework(vm)
+    service_specific_dir = os.path.join('edw', self.SERVICE_TYPE)
+    service_specific_script_list = ['script_runner.sh',
+                                    'provider_specific_script_driver.py']
+    for script in service_specific_script_list:
+      vm.PushFile(data.ResourcePath(os.path.join(service_specific_dir, script)))
+    runner_perms_update_cmd = 'chmod 755 {}'.format('script_runner.sh')
+    vm.RemoteCommand(runner_perms_update_cmd)
+
+  def GenerateScriptExecutionCommand(self, script):
+    """Method to generate the command for running the sql script on the vm.
+
+    Args:
+      script: Script to execute on the client vm.
+
+    Returns:
+      Instance specific command to execute the sql script.
+    """
+    launch_command = super(Redshift,
+                           self).GenerateScriptExecutionCommand(script)
+    launch_command.append(self.RunCommandHelper())
+    return ' '.join(launch_command)

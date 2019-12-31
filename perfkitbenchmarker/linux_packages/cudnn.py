@@ -1,4 +1,4 @@
-# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2019 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,53 +15,39 @@
 
 """Module containing CUDA Deep Neural Network library installation functions."""
 
-import posixpath
-from perfkitbenchmarker import data
 from perfkitbenchmarker import flags
+from perfkitbenchmarker.linux_packages import cuda_toolkit
 
-CUDNN_6 = 'libcudnn6_6.0.21-1+cuda8.0_amd64.deb'
-CUDNN_7 = 'libcudnn7_7.0.5.15-1+cuda9.0_amd64.deb'
+CUDNN_7_4_9 = 'libcudnn7=7.4.2.24-1+cuda9.0'
+CUDNN_7_4_10 = 'libcudnn7=7.4.2.24-1+cuda10.0'
+CUDNN_7_6_1 = 'libcudnn7=7.6.1.34-1+cuda10.1'
 
-flags.DEFINE_string('cudnn', CUDNN_7,
-                    'The NVIDIA CUDA Deep Neural Network library. '
-                    'Please put in data directory and specify the name')
 FLAGS = flags.FLAGS
 
 
-def _Install(vm, dest_path):
-  vm.RemoteCommand('tar -zxf %s' % dest_path, should_log=True)
-  vm.RemoteCommand('sudo cp -P cuda/include/cudnn.h %s/include/' %
-                   FLAGS.cuda_toolkit_installation_dir)
-  vm.RemoteCommand('sudo cp -P cuda/lib64/libcudnn* %s/lib64/' %
-                   FLAGS.cuda_toolkit_installation_dir)
-
-
-def _CopyLib(vm):
-  # If the cudnn flag was passed on the command line,
-  # use that value for the cudnn path. Otherwise, chose
-  # an intelligent default given the cuda toolkit version
-  # specified.
-  if FLAGS['cudnn'].present:
-    cudnn_path = FLAGS.cudnn
-  else:
-    if FLAGS.cuda_toolkit_version == '8.0':
-      cudnn_path = CUDNN_6
-    elif FLAGS.cuda_toolkit_version == '9.0':
-      cudnn_path = CUDNN_7
-
-  src_path = data.ResourcePath(cudnn_path)
-  dest_path = posixpath.join('/tmp', cudnn_path)
-  vm.RemoteCopy(src_path, dest_path)
-  return dest_path
-
-
 def AptInstall(vm):
-  dest_path = _CopyLib(vm)
-  if dest_path.endswith('.deb'):
-    vm.RemoteCommand('sudo dpkg -i %s' % dest_path, should_log=True)
+  """Installs the cudnn package on the VM."""
+  if not cuda_toolkit.CheckNvidiaSmiExists(vm):
+    raise Exception('CUDA Toolkit is a prerequisite for installing CUDNN.')
+  if FLAGS.cuda_toolkit_version == '9.0':
+    cudnn_version = CUDNN_7_4_9
+  elif FLAGS.cuda_toolkit_version == '10.0':
+    cudnn_version = CUDNN_7_4_10
+  elif FLAGS.cuda_toolkit_version == '10.1':
+    cudnn_version = CUDNN_7_6_1
   else:
-    _Install(vm, dest_path)
-
-
-def YumInstall(vm):
-  _Install(vm, _CopyLib(vm))
+    raise Exception('No CUDNN version found for given CUDA version.')
+  # dirmngr is needed for getting the certificate from network
+  vm.RemoteCommand(
+      'sudo apt-get install -y --no-install-recommends dirmngr',
+      should_log=True)
+  vm.RemoteCommand(
+      'sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/'
+      'compute/cuda/repos/ubuntu1604/x86_64/7fa2af80.pub', should_log=True)
+  vm.RemoteCommand(
+      'sudo bash -c \'echo "deb https://developer.download.nvidia.com/compute/'
+      'machine-learning/repos/ubuntu1604/x86_64 /" > /etc/apt/sources.list.d/'
+      'nvidia-ml.list\'', should_log=True)
+  vm.RemoteCommand('sudo apt-get update', should_log=True)
+  vm.RemoteCommand('sudo apt-get install -y --no-install-recommends '
+                   '{}'.format(cudnn_version), should_log=True)

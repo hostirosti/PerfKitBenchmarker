@@ -18,7 +18,10 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
 
 FLAGS = flags.FLAGS
-MAX_NUM_WAITS_FOR_K8S_GET = 6
+flags.DEFINE_integer('k8s_get_retry_count', 18,
+                     'Maximum number of waits for getting LoadBalancer external IP')
+flags.DEFINE_integer('k8s_get_wait_interval', 10,
+                     'Wait interval for getting LoadBalancer external IP')
 
 
 def checkKubernetesFlags():
@@ -40,7 +43,7 @@ def CreateFromFile(file_name):
 def DeleteFromFile(file_name):
   checkKubernetesFlags()
   delete_cmd = [FLAGS.kubectl, '--kubeconfig=%s' % FLAGS.kubeconfig, 'delete',
-                '-f', file_name]
+                '-f', file_name, '--ignore-not-found']
   vm_util.IssueRetryableCommand(delete_cmd)
 
 
@@ -63,7 +66,8 @@ def Get(resource, resourceInstanceName, labelFilter, jsonSelector):
   if len(labelFilter) > 0:
     get_pod_cmd.append('-l ' + labelFilter)
   get_pod_cmd.append('-ojsonpath={{{}}}'.format(jsonSelector))
-  stdout, stderr, _ = vm_util.IssueCommand(get_pod_cmd, suppress_warning=True)
+  stdout, stderr, _ = vm_util.IssueCommand(get_pod_cmd, suppress_warning=True,
+                                           raise_on_failure=False)
   if len(stderr) > 0:
     raise Exception("Error received from kubectl get: " + stderr)
   return stdout
@@ -71,16 +75,16 @@ def Get(resource, resourceInstanceName, labelFilter, jsonSelector):
 
 def GetWithWaitForContents(resource, resourceInstanceName, filter, jsonFilter):
   ret = Get(resource, resourceInstanceName, filter, jsonFilter)
-  numWaitsLeft = MAX_NUM_WAITS_FOR_K8S_GET
+  numWaitsLeft = FLAGS.k8s_get_retry_count
   while len(ret) == 0 and numWaitsLeft > 0:
-    time.sleep(10)
+    time.sleep(FLAGS.k8s_get_wait_interval)
     ret = Get(resource, resourceInstanceName, filter, jsonFilter)
     numWaitsLeft -= 1
   return ret
 
 
 def CreateResource(resource_body):
-  with vm_util.NamedTemporaryFile() as tf:
+  with vm_util.NamedTemporaryFile(mode='w') as tf:
     tf.write(resource_body)
     tf.close()
     CreateFromFile(tf.name)

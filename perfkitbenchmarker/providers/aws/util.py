@@ -14,13 +14,21 @@
 
 """Utilities for working with Amazon Web Services resources."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import collections
 import json
 import re
 import string
 
+
+from perfkitbenchmarker import context
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
+import six
 
 AWS_PATH = 'aws'
 AWS_PREFIX = [AWS_PATH, '--output', 'json']
@@ -45,8 +53,10 @@ def GetRegionFromZone(zone_or_region):
 def GetRegionFromZones(zones):
   """Returns the region a set of zones are in.
 
+  Args:
+    zones: A set of zones.
   Raises:
-      Exception: if the zones are in different regions.
+    Exception: if the zones are in different regions.
   """
   region = None
   for zone in zones:
@@ -55,9 +65,71 @@ def GetRegionFromZones(zones):
       region = current_region
     else:
       if region != current_region:
-        raise Exception('Not All zones are in the same region %s not same as %s. zones: %s' %
+        raise Exception('Not All zones are in the same region %s not same as '
+                        '%s. zones: %s' %
                         (region, current_region, ','.join(zones)))
   return region
+
+
+def GetZonesInRegion(region):
+  """Returns all available zones in a given region."""
+  get_zones_cmd = AWS_PREFIX + [
+      'ec2',
+      'describe-availability-zones',
+      '--region={0}'.format(region)
+  ]
+  stdout, _, _ = vm_util.IssueCommand(get_zones_cmd)
+  response = json.loads(stdout)
+  zones = [item['ZoneName'] for item in response['AvailabilityZones']
+           if item['State'] == 'available']
+  return zones
+
+
+def GroupZonesIntoRegions(zones):
+  """Returns a map of regions to zones."""
+  regions_to_zones_map = collections.defaultdict(set)
+  for zone in zones:
+    region = GetRegionFromZone(zone)
+    regions_to_zones_map[region].add(zone)
+  return regions_to_zones_map
+
+
+def EksZonesValidator(value):
+  if len(value) < 2:
+    return False
+  if any(IsRegion(zone) for zone in value):
+    return False
+  region = GetRegionFromZone(value[0])
+  if any(GetRegionFromZone(zone) != region for zone in value):
+    return False
+  return True
+
+
+def FormatTags(tags_dict):
+  """Format a dict of tags into arguments for 'tag' parameter.
+
+  Args:
+    tags_dict: Tags to be formatted.
+
+  Returns:
+    A list of tags formatted as arguments for 'tag' parameter.
+  """
+  return ['Key=%s,Value=%s' % (k, v) for k, v in six.iteritems(tags_dict)]
+
+
+def FormatTagSpecifications(resource_type, tags_dict):
+  """Format a dict of tags into arguments for 'tag-specifications' parameter.
+
+  Args:
+    resource_type: resource type to be tagged.
+    tags_dict: Tags to be formatted.
+
+  Returns:
+    A list of tags formatted as arguments for 'tag-specifications' parameter.
+  """
+  tags = ','.join('{Key=%s,Value=%s}' %
+                  (k, v) for k, v in six.iteritems(tags_dict))
+  return 'ResourceType=%s,Tags=[%s]' % (resource_type, tags)
 
 
 def AddTags(resource_id, region, **kwargs):
@@ -76,10 +148,28 @@ def AddTags(resource_id, region, **kwargs):
       'create-tags',
       '--region=%s' % region,
       '--resources', resource_id,
-      '--tags']
-  for key, value in kwargs.iteritems():
-    tag_cmd.append('Key={0},Value={1}'.format(key, value))
+      '--tags'] + FormatTags(kwargs)
   IssueRetryableCommand(tag_cmd)
+
+
+def MakeDefaultTags(timeout_minutes=None):
+  """Default tags for an AWS resource created by PerfKitBenchmarker.
+
+  Args:
+    timeout_minutes: Timeout used for setting the timeout_utc tag.
+
+  Returns:
+    Dict of default tags, contributed from the benchmark spec.
+  """
+  benchmark_spec = context.GetThreadBenchmarkSpec()
+  if not benchmark_spec:
+    return {}
+  return benchmark_spec.GetResourceTags(timeout_minutes=timeout_minutes)
+
+
+def MakeFormattedDefaultTags(timeout_minutes=None):
+  """Get the default tags formatted correctly for --tags parameter."""
+  return FormatTags(MakeDefaultTags(timeout_minutes=timeout_minutes))
 
 
 def AddDefaultTags(resource_id, region):
@@ -93,7 +183,7 @@ def AddDefaultTags(resource_id, region):
     resource_id: An extant AWS resource to operate on.
     region: The AWS region 'resource_id' was created in.
   """
-  tags = {'owner': FLAGS.owner, 'perfkitbenchmarker-run': FLAGS.run_uri}
+  tags = MakeDefaultTags()
   AddTags(resource_id, region, **tags)
 
 
@@ -113,7 +203,7 @@ def GetAccount():
 
 
 @vm_util.Retry()
-def IssueRetryableCommand(cmd, env=None):
+def IssueRetryableCommand(cmd, env=None, suppress_failure=None):
   """Tries running the provided command until it succeeds or times out.
 
   On Windows, the AWS CLI doesn't correctly set the return code when it
@@ -124,11 +214,13 @@ def IssueRetryableCommand(cmd, env=None):
     cmd: A list of strings such as is given to the subprocess.Popen()
         constructor.
     env: An alternate environment to pass to the Popen command.
+    suppress_failure: A function to pass to vm_util.IssueCommand()
 
   Returns:
     A tuple of stdout and stderr from running the provided command.
   """
-  stdout, stderr, retcode = vm_util.IssueCommand(cmd, env=env)
+  stdout, stderr, retcode = vm_util.IssueCommand(
+      cmd, env=env, raise_on_failure=False, suppress_failure=suppress_failure)
   if retcode:
     raise errors.VmUtil.CalledProcessException(
         'Command returned a non-zero exit code.\n')

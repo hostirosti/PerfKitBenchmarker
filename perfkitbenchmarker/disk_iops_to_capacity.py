@@ -46,6 +46,9 @@ To utilize this class, initialize an instance of the DiskIOPSToCapacity class
 with the IOPS level desired and the provider you wish to use. The machine
 requirement attributes will be immediately populated.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import math
 import numpy
 
@@ -129,8 +132,8 @@ class DiskIOPSToCapacity(object):
   def _ValidateStorageType(self):
     """Validate storage type for given _provider, set to default if not given.
 
-       Raises:
-        InvalidStorageTypeError: Incorrect storage type given.
+    Raises:
+      InvalidStorageTypeError: Incorrect storage type given.
 
     TODO: When support other types of storage types (i.e. when this class
     supports ebs-piops for AWS or pd-hhd for gcp), will need to update
@@ -152,7 +155,7 @@ class DiskIOPSToCapacity(object):
     Raises:
       InvalidProviderError: Incorrect provider type given.
     """
-    if self._provider not in CLOUD_PROVIDERS_INFO.keys():
+    if self._provider not in list(CLOUD_PROVIDERS_INFO.keys()):
       raise InvalidProviderError('Provider given is not supported by '
                                  'storage_utility.')
 
@@ -186,10 +189,11 @@ class DiskIOPSToCapacity(object):
                  'Disks: {}').format(self._iops,
                                      self._provider.upper(), self._size,
                                      self._cpu_count, self._number_disks)
-    print vm_config
+    print(vm_config)
 
   def _SetSize(self):
     """Set minimum size (GB) necessary to achieve _iops level.
+
     Rating performance levels as of May 2017, sources found below.
     GCP: ratings from https://cloud.google.com/compute/docs/disks/. Storage can
           go as high as 64TB per disk but IOPS maxes out at 30,000 iops/disk
@@ -206,7 +210,7 @@ class DiskIOPSToCapacity(object):
       value = self._iops
       value = numpy.array(value)
       self._size = int(
-          numpy.piecewise(value, [[value <= 100], [(value > 100) & (
+          numpy.piecewise([value], [[value <= 100], [(value > 100) & (
               value <= 9999)], [value > 9999]], [
                   lambda x: int(math.ceil(1.07374)),
                   lambda x: int(math.ceil(3 * value)),
@@ -214,6 +218,7 @@ class DiskIOPSToCapacity(object):
 
   def GetSize(self):
     """Return storage size.
+
     Returns:
       __size: Storage size (GB).
     """
@@ -234,7 +239,7 @@ class DiskIOPSToCapacity(object):
     if self._provider == GCP:
       value = self._iops
       self._cpu_count = int(
-          numpy.piecewise(value, [[value <= 15000], [
+          numpy.piecewise([value], [[value <= 15000], [
               (value > 15000) & (value <= 25000)
           ], [value > 25000]], [lambda x: 1, lambda x: 16, lambda x: 32]))
     elif self._provider == AWS:

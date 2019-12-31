@@ -22,6 +22,10 @@ Images:
   run 'openstack image list'
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import json
 import logging
 import threading
@@ -34,8 +38,10 @@ from perfkitbenchmarker import providers
 from perfkitbenchmarker.providers.openstack import os_disk
 from perfkitbenchmarker.providers.openstack import os_network
 from perfkitbenchmarker.providers.openstack import utils as os_utils
+from six.moves import range
 
 RHEL_IMAGE = 'rhel-7.2'
+CENTOS_IMAGE = 'centos7'
 UBUNTU_IMAGE = 'ubuntu-14.04'
 NONE = 'None'
 
@@ -361,7 +367,12 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
                                            self.network_name)
     net_stdout, _, _ = net_cmd.Issue()
     network = json.loads(net_stdout)
-    self.subnet_id = network['subnets']
+
+    if isinstance(network['subnets'], list):
+      self.subnet_id = network['subnets'][0]
+    else:
+      self.subnet_id = network['subnets']
+
     subnet_cmd = os_utils.OpenStackCLICommand(self, 'subnet', 'show',
                                               self.subnet_id)
     stdout, _, _ = subnet_cmd.Issue()
@@ -392,3 +403,20 @@ class DebianBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
 class RhelBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
                                        linux_virtual_machine.RhelMixin):
   DEFAULT_IMAGE = RHEL_IMAGE
+
+  def __init__(self, vm_spec):
+    super(RhelBasedOpenStackVirtualMachine, self).__init__(vm_spec)
+    self.python_package_config = 'python'
+    self.python_dev_package_config = 'python-devel'
+    self.python_pip_package_config = 'python2-pip'
+
+
+class Centos7BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                          linux_virtual_machine.Centos7Mixin):
+  DEFAULT_IMAGE = CENTOS_IMAGE
+
+  def __init__(self, vm_spec):
+    super(Centos7BasedOpenStackVirtualMachine, self).__init__(vm_spec)
+    self.python_package_config = 'python'
+    self.python_dev_package_config = 'python-devel'
+    self.python_pip_package_config = 'python2-pip'

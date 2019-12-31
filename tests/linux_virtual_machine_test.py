@@ -1,4 +1,4 @@
-# Copyright 2016 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for linux_virtual_machine.py"""
+"""Tests for linux_virtual_machine.py."""
 
 import unittest
-
 import mock
 
+from perfkitbenchmarker import flags
 from perfkitbenchmarker import linux_virtual_machine
-from tests import mock_flags
+from perfkitbenchmarker import os_types
+from perfkitbenchmarker import pkb
+from perfkitbenchmarker import sample
+from perfkitbenchmarker import test_util
+from perfkitbenchmarker import virtual_machine
+from tests import pkb_common_test_case
+
+FLAGS = flags.FLAGS
 
 
 # Need to provide implementations for all of the abstract methods in
 # order to instantiate linux_virtual_machine.BaseLinuxMixin.
 class LinuxVM(linux_virtual_machine.BaseLinuxMixin):
+
   def Install(self):
     pass
 
@@ -32,7 +40,31 @@ class LinuxVM(linux_virtual_machine.BaseLinuxMixin):
     pass
 
 
-class TestSetFiles(unittest.TestCase):
+class LinuxVMResource(virtual_machine.BaseVirtualMachine,
+                      linux_virtual_machine.BaseLinuxMixin):
+
+  CLOUD = 'fake_cloud'
+  OS_TYPE = 'fake_os_type'
+  BASE_OS_TYPE = 'debian'
+
+  def __init__(self, _):
+    super(LinuxVMResource, self).__init__(virtual_machine.BaseVmSpec('test'))
+
+  def Install(self):
+    pass
+
+  def Uninstall(self):
+    pass
+
+  def _Create(self):
+    pass
+
+  def _Delete(self):
+    pass
+
+
+class TestSetFiles(pkb_common_test_case.PkbCommonTestCase):
+
   def runTest(self, set_files, calls):
     """Run a SetFiles test.
 
@@ -41,16 +73,14 @@ class TestSetFiles(unittest.TestCase):
       calls: a list of mock.call() objects giving the expected calls to
         vm.RemoteCommand() for the test.
     """
-
-    self.mocked_flags = mock_flags.PatchTestCaseFlags(self)
-    self.mocked_flags.set_files = set_files
+    FLAGS['set_files'].parse(set_files)
 
     vm = LinuxVM()
 
     with mock.patch.object(vm, 'RemoteCommand') as remote_command:
       vm.SetFiles()
 
-    self.assertItemsEqual(  # use assertItemsEqual because order is undefined
+    self.assertCountEqual(  # use assertCountEqual because order is undefined
         remote_command.call_args_list,
         calls)
 
@@ -72,34 +102,274 @@ class TestSetFiles(unittest.TestCase):
                             '/sys/kernel/mm/transparent_hugepage/defrag')])
 
 
-class TestSysctl(unittest.TestCase):
-  def testSysctl(self):
-    self.mocked_flags = mock_flags.PatchTestCaseFlags(self)
-    self.mocked_flags.sysctl = ['vm.dirty_background_ratio=10',
-                                'vm.dirty_ratio=25']
+class TestSysctl(pkb_common_test_case.PkbCommonTestCase):
+
+  def runTest(self, sysctl, calls):
+    FLAGS['sysctl'].parse(sysctl)
     vm = LinuxVM()
 
     with mock.patch.object(vm, 'RemoteCommand') as remote_command:
       vm.DoSysctls()
 
-    self.assertEqual(
-        remote_command.call_args_list,
+    self.assertEqual(sorted(remote_command.call_args_list), sorted(calls))
+
+  def testSysctl(self):
+    self.runTest(
+        ['vm.dirty_background_ratio=10', 'vm.dirty_ratio=25'],
         [mock.call('sudo bash -c \'echo "vm.dirty_background_ratio=10" >> '
                    '/etc/sysctl.conf\''),
          mock.call('sudo bash -c \'echo "vm.dirty_ratio=25" >> '
                    '/etc/sysctl.conf\'')])
 
   def testNoSysctl(self):
-    self.mocked_flags = mock_flags.PatchTestCaseFlags(self)
-    self.mocked_flags.sysctl = []
-    vm = LinuxVM()
+    self.runTest([],
+                 [])
 
-    with mock.patch.object(vm, 'RemoteCommand') as remote_command:
-      vm.DoSysctls()
 
+class TestDiskOperations(pkb_common_test_case.PkbCommonTestCase):
+
+  def setUp(self):
+    super(TestDiskOperations, self).setUp()
+    FLAGS['default_timeout'].parse(0)  # due to @retry
+    patcher = mock.patch.object(LinuxVM, 'RemoteHostCommand')
+    self.remote_command = patcher.start()
+    self.addCleanup(patcher.stop)
+    self.remote_command.side_effect = [('', None, 0), ('', None, 0)]
+    self.vm = LinuxVM()
+
+  def assertRemoteHostCalled(self, *calls):
+    self.assertEqual([mock.call(call) for call in calls],
+                     self.remote_command.call_args_list)
+
+  def testMountDisk(self):
+    mkdir_cmd = ('sudo mkdir -p mp;'
+                 'sudo mount -o discard dp mp && '
+                 'sudo chown $USER:$USER mp;')
+    fstab_cmd = 'echo "dp mp ext4 defaults" | sudo tee -a /etc/fstab'
+    self.vm.MountDisk('dp', 'mp')
+    self.assertRemoteHostCalled(mkdir_cmd, fstab_cmd)
+
+  def testFormatDisk(self):
+    expected_command = ('[[ -d /mnt ]] && sudo umount /mnt; '
+                        'sudo mke2fs -F -E lazy_itable_init=0,discard '
+                        '-O ^has_journal -t ext4 -b 4096 dp')
+    self.vm.FormatDisk('dp')
+    self.assertRemoteHostCalled(expected_command)
+    self.assertEqual('ext4', self.vm.os_metadata['disk_filesystem_type'])
+    self.assertEqual(4096, self.vm.os_metadata['disk_filesystem_blocksize'])
+
+  def testNfsMountDisk(self):
+    mkdir_cmd = ('sudo mkdir -p mp;'
+                 'sudo mount -t nfs -o hard,ro dp mp && '
+                 'sudo chown $USER:$USER mp;')
+    fstab_cmd = 'echo "dp mp nfs ro" | sudo tee -a /etc/fstab'
+    self.vm.MountDisk('dp', 'mp',
+                      disk_type='nfs', mount_options='hard,ro',
+                      fstab_options='ro')
+    self.assertRemoteHostCalled(mkdir_cmd, fstab_cmd)
+
+  def testNfsFormatDisk(self):
+    self.vm.FormatDisk('dp', disk_type='nfs')
+    self.assertRemoteHostCalled()  # no format disk command executed
+
+
+class LogDmesgTestCase(pkb_common_test_case.PkbCommonTestCase):
+
+  def setUp(self):
+    super(LogDmesgTestCase, self).setUp()
+    self.vm = LinuxVMResource(None)
+
+  def testPreDeleteDoesNotCallDmesg(self):
+    FLAGS.log_dmesg = False
+    with mock.patch.object(self.vm, 'RemoteCommand') as remote_command:
+      self.vm._PreDelete()
+    remote_command.assert_not_called()
+
+  def testPreDeleteCallsDmesg(self):
+    FLAGS.log_dmesg = True
+    with mock.patch.object(self.vm, 'RemoteCommand') as remote_command:
+      self.vm._PreDelete()
+    remote_command.assert_called_once_with('hostname && dmesg', should_log=True)
+
+
+class TestLsCpu(unittest.TestCase, test_util.SamplesTestMixin):
+
+  LSCPU_DATA = {
+      'NUMA node(s)': '1',
+      'Core(s) per socket': '2',
+      'Socket(s)': '3',
+      'a': 'b',
+  }
+
+  PROC_CPU_TEXT = """
+  processor: 29
+  cpu family: 6
+  core id: 13
+  oddkey: v29
+  apicid: 27
+
+  processor: 30
+  cpu family: 6
+  core id: 14
+  oddkey: v30
+  apicid:29
+
+  processor: 31
+  cpu family: 6
+  core id: 15
+  apicid: 31
+  """
+
+  def LsCpuText(self, data):
+    return '\n'.join(['%s:%s' % entry for entry in data.items()])
+
+  def CreateVm(self, os_type, remote_command_text):
+    vm = LinuxVMResource(None)
+    vm.OS_TYPE = os_type  # pylint: disable=invalid-name
+    vm.RemoteCommand = mock.Mock()  # pylint: disable=invalid-name
+    vm.RemoteCommand.return_value = remote_command_text, ''
+    vm.name = 'pkb-test'
+    return vm
+
+  def testRecordLscpuOutputLinux(self):
+    vm = self.CreateVm(os_types.UBUNTU1604, self.LsCpuText(self.LSCPU_DATA))
+    samples = pkb._CreateLscpuSamples([vm])
+    vm.RemoteCommand.assert_called_with('lscpu')
+    self.assertEqual(1, len(samples))
+    metadata = {'node_name': vm.name}
+    metadata.update(self.LSCPU_DATA)
+    expected = sample.Sample('lscpu', 0, '', metadata, samples[0].timestamp)
+    self.assertEqual(expected, samples[0])
+
+  def testRecordLscpuOutputNonLinux(self):
+    vm = self.CreateVm(os_types.WINDOWS, '')
+    samples = pkb._CreateLscpuSamples([vm])
+    self.assertEqual(0, len(samples))
+    vm.RemoteCommand.assert_not_called()
+
+  def testMissingRequiredLsCpuEntries(self):
+    with self.assertRaises(ValueError):
+      linux_virtual_machine.LsCpuResults('')
+
+  def testLsCpuParsing(self):
+    vm = self.CreateVm(os_types.UBUNTU1604,
+                       self.LsCpuText(self.LSCPU_DATA) + '\nThis Line=Invalid')
+    results = vm.CheckLsCpu()
+    self.assertEqual(1, results.numa_node_count)
+    self.assertEqual(2, results.cores_per_socket)
+    self.assertEqual(3, results.socket_count)
     self.assertEqual(
-        remote_command.call_args_list,
-        [])
+        {
+            'NUMA node(s)': '1',
+            'Core(s) per socket': '2',
+            'Socket(s)': '3',
+            'a': 'b'
+        }, results.data)
+
+  def testProcCpuParsing(self):
+    vm = self.CreateVm(os_types.UBUNTU1604, self.PROC_CPU_TEXT)
+    results = vm.CheckProcCpu()
+    expected_mappings = {}
+    expected_mappings[29] = {'apicid': '27', 'core id': '13'}
+    expected_mappings[30] = {'apicid': '29', 'core id': '14'}
+    expected_mappings[31] = {'apicid': '31', 'core id': '15'}
+    expected_common = {
+        'cpu family': '6',
+        'oddkey': 'v29;v30',
+        'proccpu': 'cpu family,oddkey'
+    }
+    self.assertEqual(expected_mappings, results.mappings)
+    self.assertEqual(expected_common, results.GetValues())
+
+  def testProcCpuSamples(self):
+    vm = self.CreateVm(os_types.UBUNTU1604, self.PROC_CPU_TEXT)
+    samples = pkb._CreateProcCpuSamples([vm])
+    proccpu_metadata = {
+        'cpu family': '6',
+        'node_name': 'pkb-test',
+        'oddkey': 'v29;v30',
+        'proccpu': 'cpu family,oddkey',
+    }
+    proccpu_mapping_metadata = {
+        'node_name': 'pkb-test',
+        'proc_29': 'apicid=27;core id=13',
+        'proc_30': 'apicid=29;core id=14',
+        'proc_31': 'apicid=31;core id=15'
+    }
+    expected_samples = [
+        sample.Sample('proccpu', 0, '', proccpu_metadata),
+        sample.Sample('proccpu_mapping', 0, '', proccpu_mapping_metadata)
+    ]
+    self.assertSampleListsEqualUpToTimestamp(expected_samples, samples)
+
+
+class TestPartitionTable(unittest.TestCase):
+
+  def CreateVm(self, remote_command_text):
+    vm = LinuxVMResource(None)
+    vm.RemoteCommand = mock.Mock()  # pylint: disable=invalid-name
+    vm.RemoteCommand.return_value = remote_command_text, ''
+    vm.name = 'pkb-test'
+    vm._partition_table = {}
+    return vm
+
+  def testFdiskNoPartitonTable(self):
+    vm = self.CreateVm('')
+    results = vm.partition_table
+    self.assertEqual({}, results)
+
+  def testFdiskParsingBootDiskOnly(self):
+    vm = self.CreateVm("""
+Disk /dev/sda: 10.7 GB, 10737418240 bytes
+4 heads, 32 sectors/track, 163840 cylinders, total 20971520 sectors
+Units = sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 4096 bytes
+I/O size (minimum/optimal): 4096 bytes / 4096 bytes
+Disk identifier: 0x00067934
+
+   Device Boot      Start         End      Blocks   Id  System
+/dev/sda1   *        2048    20971519    10484736   83  Linux
+    """)
+    results = vm.partition_table
+    self.assertEqual(
+        {'/dev/sda': 10737418240}, results)
+
+  def testFdiskParsingWithRaidDisk(self):
+    vm = self.CreateVm("""
+Disk /dev/sda: 10 GiB, 10737418240 bytes, 20971520 sectors
+Units: sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 4096 bytes
+I/O size (minimum/optimal): 4096 bytes / 4096 bytes
+Disklabel type: dos
+Disk identifier: 0x8c87e63b
+
+Device     Boot Start      End  Sectors Size Id Type
+/dev/sda1  *     2048 20971486 20969439  10G 83 Linux
+
+
+Disk /dev/sdb: 375 GiB, 402653184000 bytes, 98304000 sectors
+Units: sectors of 1 * 4096 = 4096 bytes
+Sector size (logical/physical): 4096 bytes / 4096 bytes
+I/O size (minimum/optimal): 4096 bytes / 4096 bytes
+
+
+Disk /dev/sdc: 375 GiB, 402653184000 bytes, 98304000 sectors
+Units: sectors of 1 * 4096 = 4096 bytes
+Sector size (logical/physical): 4096 bytes / 4096 bytes
+I/O size (minimum/optimal): 4096 bytes / 4096 bytes
+
+
+Disk /dev/md0: 749.8 GiB, 805037932544 bytes, 196542464 sectors
+Units: sectors of 1 * 4096 = 4096 bytes
+Sector size (logical/physical): 4096 bytes / 4096 bytes
+I/O size (minimum/optimal): 524288 bytes / 1048576 bytes
+    """)
+    results = vm.partition_table
+    self.assertEqual(
+        {'/dev/sda': 10737418240,
+         '/dev/sdb': 402653184000,
+         '/dev/sdc': 402653184000,
+         '/dev/md0': 805037932544}, results)
 
 
 if __name__ == '__main__':

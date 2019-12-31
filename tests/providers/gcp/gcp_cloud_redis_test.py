@@ -15,38 +15,35 @@
 import unittest
 import mock
 
-from perfkitbenchmarker.configs import benchmark_config_spec
+from perfkitbenchmarker import flags
 from perfkitbenchmarker.providers.gcp import gcp_cloud_redis
 from perfkitbenchmarker.providers.gcp import util
-from tests import mock_flags
+from tests import pkb_common_test_case
+
+FLAGS = flags.FLAGS
 
 
-class GcpCloudRedisTestCase(unittest.TestCase):
+class GcpCloudRedisTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    mocked_flags = mock_flags.MockFlags()
-    mocked_flags.project = 'project'
-    mock_spec = mock.Mock(
-        spec=benchmark_config_spec._CloudRedisSpec)
-    mock_spec.redis_name = 'foobar'
-    mock_spec.redis_tier = 'tier'
-    mock_spec.redis_size_gb = 5
-    mock_spec.redis_version = 'version'
-    with mock_flags.PatchFlags(mocked_flags):
-      self.redis = gcp_cloud_redis.CloudRedis(mock_spec)
+    super(GcpCloudRedisTestCase, self).setUp()
+    FLAGS.project = 'project'
+    FLAGS.zones = ['us-central1-a']
+    mock_spec = mock.Mock()
+    self.redis = gcp_cloud_redis.CloudRedis(mock_spec)
 
   def testCreate(self):
     with mock.patch.object(util.GcloudCommand, 'Issue',
                            return_value=('{}', '', 0)) as gcloud:
       self.redis._Create()
-      gcloud.assert_called_once_with()
+      gcloud.assert_called_once_with(timeout=600)
       self.assertTrue(self.redis._Exists())
 
   def testDelete(self):
     with mock.patch.object(util.GcloudCommand, 'Issue',
                            return_value=('{}', '', 0)) as gcloud:
       self.redis._Delete()
-      gcloud.assert_called_once_with()
+      gcloud.assert_called_once_with(raise_on_failure=False, timeout=600)
 
   def testExistTrue(self):
     with mock.patch.object(util.GcloudCommand, 'Issue',
@@ -57,11 +54,6 @@ class GcpCloudRedisTestCase(unittest.TestCase):
     with mock.patch.object(util.GcloudCommand, 'Issue',
                            return_value=('{}', '', 1)):
       self.assertFalse(self.redis._Exists())
-
-  def testGetInstanceDetails(self):
-    with mock.patch.object(util.GcloudCommand, 'Issue',
-                           return_value=('{"foo": "bar"}', '', 0)):
-      self.assertEqual(self.redis.GetInstanceDetails(), {'foo': 'bar'})
 
 if __name__ == '__main__':
   unittest.main()

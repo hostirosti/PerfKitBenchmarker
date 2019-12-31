@@ -1,4 +1,4 @@
-# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
 
 """Tests for flag_util.py."""
 
-import copy
 import sys
 import unittest
 
-from perfkitbenchmarker import flags
 from perfkitbenchmarker import flag_util
+from perfkitbenchmarker import flags
 from perfkitbenchmarker import units
 
 
 class TestIntegerList(unittest.TestCase):
+
   def testSimpleLength(self):
     il = flag_util.IntegerList([1, 2, 3])
     self.assertEqual(len(il), 3)
@@ -86,25 +86,73 @@ class TestIntegerList(unittest.TestCase):
 
 
 class TestParseIntegerList(unittest.TestCase):
+
   def setUp(self):
     self.ilp = flag_util.IntegerListParser()
 
   def testOneInteger(self):
     self.assertEqual(list(self.ilp.parse('3')), [3])
+    self.assertEqual(list(self.ilp.parse('-3')), [-3])
+
+  def testMultipleIntegers(self):
+    self.assertEqual(list(self.ilp.parse('1,-1,4')), [1, -1, 4])
 
   def testIntegerRange(self):
     self.assertEqual(list(self.ilp.parse('3-5')), [3, 4, 5])
+    self.assertEqual(list(self.ilp.parse('3:5')), [3, 4, 5])
+    self.assertEqual(list(self.ilp.parse('5-3')), [5, 4, 3])
+    self.assertEqual(list(self.ilp.parse('5:3')), [5, 4, 3])
+    self.assertEqual(list(self.ilp.parse('-3:-1')), [-3, -2, -1])
+    self.assertEqual(list(self.ilp.parse('-1:-3')), [-1, -2, -3])
 
   def testIntegerRangeWithStep(self):
     self.assertEqual(list(self.ilp.parse('2-7-2')), [2, 4, 6])
+    self.assertEqual(list(self.ilp.parse('2:7:2')), [2, 4, 6])
+    # go from -3 to 1 with step 2: -3, -3+2 = -1, -1+2 = 1,
+    # finally 1 + 2 = 3 which is beyond the end of the range.
+    self.assertEqual(list(self.ilp.parse('-3:1:2')), [-3, -1, 1])
 
   def testIntegerList(self):
     self.assertEqual(list(self.ilp.parse('3-5,8,10-12')),
+                     [3, 4, 5, 8, 10, 11, 12])
+    self.assertEqual(list(self.ilp.parse('3:5,8,10:12')),
                      [3, 4, 5, 8, 10, 11, 12])
 
   def testIntegerListWithRangeAndStep(self):
     self.assertEqual(list(self.ilp.parse('3-5,8,10-15-2')),
                      [3, 4, 5, 8, 10, 12, 14])
+    self.assertEqual(list(self.ilp.parse('3:5,8,10:15:2')),
+                     [3, 4, 5, 8, 10, 12, 14])
+
+  def testIncreasingIntegerLists(self):
+    self.assertEqual(list(self.ilp.parse('1-5-2,6-8')),
+                     [1, 3, 5, 6, 7, 8])
+
+  def testAnyNegativeValueRequiresNewFormat(self):
+    for str_range in ('-1-5', '3--5', '3-1--1'):
+      with self.assertRaises(ValueError):
+        self.ilp.parse(str_range)
+    # how to do those in new format
+    self.assertEqual(self.ilp.parse('-1:5'), [-1, 0, 1, 2, 3, 4, 5])
+    self.assertEqual(self.ilp.parse('3:-5'), [3, 2, 1, 0, -1, -2, -3, -4, -5])
+    self.assertEqual(self.ilp.parse('3:1:-1'), [3, 2, 1])
+
+  def testNoMixingOfFormats(self):
+    with self.assertRaises(ValueError):
+      # any negative numbers -> must use the new format
+      self.ilp.parse('-1-2')
+    with self.assertRaises(ValueError):
+      # starts off with new format and then switches to old
+      self.ilp.parse('4:2-1')
+    with self.assertRaises(ValueError):
+      # starts off with old format and then switches to new
+      self.ilp.parse('4-2:1')
+
+  def testMixingFormatsOkayInDifferentChunks(self):
+    # different formats in each comma separated part are parsed separately so
+    # mixing is okay (but should probably convert all to new format)
+    self.assertEqual(list(self.ilp.parse('1-2,4,6:7')), [1, 2, 4, 6, 7])
+    self.assertEqual(list(self.ilp.parse('-1:-2,3,4-5')), [-1, -2, 3, 4, 5])
 
   def testNoInteger(self):
     with self.assertRaises(ValueError):
@@ -113,14 +161,20 @@ class TestParseIntegerList(unittest.TestCase):
   def testBadRange(self):
     with self.assertRaises(ValueError):
       self.ilp.parse('3-a')
+    with self.assertRaises(ValueError):
+      self.ilp.parse('3:a')
 
   def testBadList(self):
     with self.assertRaises(ValueError):
       self.ilp.parse('3-5,8a')
+    with self.assertRaises(ValueError):
+      self.ilp.parse('3:5,8a')
 
   def testTrailingComma(self):
     with self.assertRaises(ValueError):
       self.ilp.parse('3-5,')
+    with self.assertRaises(ValueError):
+      self.ilp.parse('3:5,')
 
   def testNonIncreasingEntries(self):
     ilp = flag_util.IntegerListParser(
@@ -133,21 +187,66 @@ class TestParseIntegerList(unittest.TestCase):
         on_nonincreasing=flag_util.IntegerListParser.EXCEPTION)
     with self.assertRaises(ValueError):
       ilp.parse('3-1')
+    with self.assertRaises(ValueError):
+      ilp.parse('3:1')
 
   def testNonIncreasingRangeWithStep(self):
     ilp = flag_util.IntegerListParser(
         on_nonincreasing=flag_util.IntegerListParser.EXCEPTION)
     with self.assertRaises(ValueError):
       ilp.parse('3-1-2')
+    with self.assertRaises(ValueError):
+      ilp.parse('3:1:2')
+    with self.assertRaises(ValueError):
+      ilp.parse('3:1:-2')
+
+  def testIntegerListsWhichAreNotIncreasing(self):
+    ilp = flag_util.IntegerListParser(
+        on_nonincreasing=flag_util.IntegerListParser.EXCEPTION)
+    with self.assertRaises(ValueError) as cm:
+      ilp.parse('1-5,3-7')
+    self.assertEqual('Integer list 1-5,3-7 is not increasing',
+                     str(cm.exception))
 
 
 class TestIntegerListSerializer(unittest.TestCase):
+
   def testSerialize(self):
     ser = flag_util.IntegerListSerializer()
     il = flag_util.IntegerList([1, (2, 5), 9])
 
     self.assertEqual(ser.serialize(il),
                      '1,2-5,9')
+    self.assertEqual(str(il), '1,2-5,9')
+    # previously was <perfkitbenchmarker.flag_util.IntegerList object at ...>
+    self.assertEqual(repr(il), 'IntegerList([1,2-5,9])')
+
+  def testSerializeNegativeNumbers(self):
+    ser = flag_util.IntegerListSerializer()
+    il = flag_util.IntegerList([-5, 4])
+    self.assertEqual(ser.serialize(il), '-5,4')
+
+  def testSerializeRangeNegativeNumbers(self):
+    ser = flag_util.IntegerListSerializer()
+    il = flag_util.IntegerList([(-5, 3)])
+    self.assertEqual(ser.serialize(il), '-5:3')
+    il = flag_util.IntegerList([(4, -2)])
+    self.assertEqual(ser.serialize(il), '4:-2')
+
+  def testSerializeRangeNegativeStep(self):
+    ser = flag_util.IntegerListSerializer()
+    # keep this in old-style format -- however should not get this
+    # tuple from the parser as the step will always have correct sign
+    il = flag_util.IntegerList([(5, 2, 1)])
+    self.assertEqual(ser.serialize(il), '5-2-1')
+    # previously serialized as 5-2--1, move to new format
+    il = flag_util.IntegerList([(5, 2, -1)])
+    self.assertEqual(ser.serialize(il), '5:2:-1')
+    # first or second value < 0
+    il = flag_util.IntegerList([(5, -2, -1)])
+    self.assertEqual(ser.serialize(il), '5:-2:-1')
+    il = flag_util.IntegerList([(-5, 2, 1)])
+    self.assertEqual(ser.serialize(il), '-5:2:1')
 
   def testSerializeWithStep(self):
     ser = flag_util.IntegerListSerializer()
@@ -157,7 +256,7 @@ class TestIntegerListSerializer(unittest.TestCase):
                      '1,2-5-2,9')
 
 
-class FlagDictSubstitutionTestCase(unittest.TestCase):
+class OverrideFlagsTestCase(unittest.TestCase):
 
   def assertFlagState(self, flag_values, value, present):
     self.assertEqual(flag_values.test_flag, value)
@@ -168,26 +267,32 @@ class FlagDictSubstitutionTestCase(unittest.TestCase):
     flag_values = flags.FlagValues()
     flags.DEFINE_integer('test_flag', 0, 'Test flag.', flag_values=flag_values)
     flag_values([sys.argv[0]])
-    flag_values_copy = copy.deepcopy(flag_values)
-    flag_values_copy.test_flag = 1
+    flag_values_overrides = {}
+    flag_values_overrides['test_flag'] = 1
     self.assertFlagState(flag_values, 0, False)
-    self.assertFlagState(flag_values_copy, 1, False)
-    if hasattr(flag_values_copy, '_flags'):
-      flag_dict_func = flag_values_copy._flags
-    else:
-      flag_dict_func = flag_values_copy.FlagDict
-    with flag_util.FlagDictSubstitution(flag_values, flag_dict_func):
-      self.assertFlagState(flag_values, 1, False)
-      self.assertFlagState(flag_values_copy, 1, False)
-      flag_values.test_flag = 2
-      flag_values['test_flag'].present += 1
-      self.assertFlagState(flag_values, 2, True)
-      self.assertFlagState(flag_values_copy, 2, True)
+    self.assertEqual(flag_values_overrides['test_flag'], 1)
+    with flag_util.OverrideFlags(flag_values, flag_values_overrides):
+      self.assertFlagState(flag_values, 1, True)
+      self.assertEqual(flag_values_overrides['test_flag'], 1)
     self.assertFlagState(flag_values, 0, False)
-    self.assertFlagState(flag_values_copy, 2, True)
+    self.assertEqual(flag_values_overrides['test_flag'], 1)
     flag_values.test_flag = 3
     self.assertFlagState(flag_values, 3, False)
-    self.assertFlagState(flag_values_copy, 2, True)
+    self.assertEqual(flag_values_overrides['test_flag'], 1)
+
+  def testFlagChangesAreNotReflectedInConfigDict(self):
+    flag_values = flags.FlagValues()
+    flags.DEFINE_integer('test_flag', 0, 'Test flag.', flag_values=flag_values)
+    flag_values([sys.argv[0]])
+    flag_values_overrides = {}
+    flag_values_overrides['test_flag'] = 1
+    self.assertFlagState(flag_values, 0, False)
+    self.assertEqual(flag_values_overrides['test_flag'], 1)
+    with flag_util.OverrideFlags(flag_values, flag_values_overrides):
+      self.assertFlagState(flag_values, 1, True)
+      flag_values.test_flag = 2
+      self.assertFlagState(flag_values, 2, True)
+      self.assertEqual(flag_values_overrides['test_flag'], 1)
 
 
 class TestUnitsParser(unittest.TestCase):
@@ -243,13 +348,15 @@ class TestUnitsParser(unittest.TestCase):
 
 
 class TestStringToBytes(unittest.TestCase):
+
   def testValidString(self):
     self.assertEqual(flag_util.StringToBytes('100KB'),
                      100000)
 
   def testUnparseableString(self):
-    with self.assertRaises(ValueError):
+    with self.assertRaises(ValueError) as cm:
       flag_util.StringToBytes('asdf')
+    self.assertEqual("Couldn't parse size asdf", str(cm.exception))
 
   def testBadUnits(self):
     with self.assertRaises(ValueError):
@@ -265,9 +372,10 @@ class TestStringToBytes(unittest.TestCase):
 
 
 class TestStringToRawPct(unittest.TestCase):
+
   def testValidPct(self):
-    self.assertEquals(flag_util.StringToRawPercent('50.5%'),
-                      50.5)
+    self.assertEqual(flag_util.StringToRawPercent('50.5%'),
+                     50.5)
 
   def testNullString(self):
     with self.assertRaises(ValueError):
@@ -304,11 +412,13 @@ class TestYAMLParser(unittest.TestCase):
                      [1, 2, 3])
 
   def testBadYAML(self):
-    with self.assertRaises(ValueError):
+    with self.assertRaises(ValueError) as cm:
       self.parser.parse('{a')
+    self.assertIn("Couldn't parse YAML string '{a': ", str(cm.exception))
 
 
 class MockFlag():
+
   def __init__(self, name, value, present):
     self.name = name
     self.value = value

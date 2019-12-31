@@ -14,9 +14,14 @@
 
 """Set of utility functions for working with virtual machines."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import contextlib
 import logging
 import os
+import platform
 import random
 import re
 import string
@@ -32,12 +37,12 @@ from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import temp_dir
+from six.moves import range
 
 FLAGS = flags.FLAGS
 
 PRIVATE_KEYFILE = 'perfkitbenchmarker_keyfile'
 PUBLIC_KEYFILE = 'perfkitbenchmarker_keyfile.pub'
-CERT_FILE = 'perfkitbenchmarker.pem'
 
 # The temporary directory on VMs. We cannot reuse GetTempDir()
 # because run_uri will not be available at time of module load and we need
@@ -54,6 +59,7 @@ FUZZ = .5
 MAX_RETRIES = -1
 
 WINDOWS = 'nt'
+DARWIN = 'Darwin'
 PASSWORD_LENGTH = 15
 
 OUTPUT_STDOUT = 0
@@ -82,6 +88,36 @@ flags.DEFINE_boolean('simulate_maintenance', False,
 flags.DEFINE_integer('simulate_maintenance_delay', 0,
                      'The number of seconds to wait to start simulating '
                      'maintenance.')
+flags.DEFINE_boolean('ssh_reuse_connections', True,
+                     'Whether to reuse SSH connections rather than '
+                     'reestablishing a connection for each remote command.')
+# We set this to the short value of 5 seconds so that the cluster boot benchmark
+# can measure a fast connection when bringing up a VM. This avoids retries that
+# may not be as quick as every 5 seconds when specifying a larger value.
+flags.DEFINE_integer('ssh_connect_timeout', 5, 'timeout for SSH connection.',
+                     lower_bound=0)
+flags.DEFINE_string('ssh_control_path', None,
+                    'Overrides the default ControlPath setting for ssh '
+                    'connections if --ssh_reuse_connections is set. This can '
+                    'be helpful on systems whose default temporary directory '
+                    'path is too long (sockets have a max path length) or a '
+                    'version of ssh that doesn\'t support the %h token. See '
+                    'ssh documentation on the ControlPath setting for more '
+                    'detailed information.')
+flags.DEFINE_string('ssh_control_persist', '30m',
+                    'Setting applied to ssh connections if '
+                    '--ssh_reuse_connections is set. Sets how long the '
+                    'connections persist before they are removed. '
+                    'See ssh documentation about the ControlPersist setting '
+                    'for more detailed information.')
+flags.DEFINE_integer('ssh_server_alive_interval', 30,
+                     'Value for ssh -o ServerAliveInterval. Use with '
+                     '--ssh_server_alive_count_max to configure how long to '
+                     'wait for unresponsive servers.')
+flags.DEFINE_integer('ssh_server_alive_count_max', 10,
+                     'Value for ssh -o ServerAliveCountMax. Use with '
+                     '--ssh_server_alive_interval to configure how long to '
+                     'wait for unresponsive servers.')
 
 
 class IpAddressSubset(object):
@@ -128,36 +164,12 @@ def SSHKeyGen():
 
   if not os.path.isfile(GetPrivateKeyPath()):
     create_cmd = ['ssh-keygen',
-                  '-t',
-                  'rsa',
-                  '-N',
-                  '',
+                  '-t', 'rsa',
+                  '-N', '',
+                  '-m', 'PEM',
                   '-q',
-                  '-f',
-                  PrependTempDir(PRIVATE_KEYFILE)]
-    shell_value = RunningOnWindows()
-    create_process = subprocess.Popen(create_cmd,
-                                      shell=shell_value,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE)
-    create_process.communicate()
-
-  if not os.path.isfile(GetCertPath()):
-    create_cmd = ['openssl',
-                  'req',
-                  '-x509',
-                  '-new',
-                  '-out',
-                  PrependTempDir(CERT_FILE),
-                  '-key',
-                  PrependTempDir(PRIVATE_KEYFILE)]
-    shell_value = RunningOnWindows()
-    create_process = subprocess.Popen(create_cmd,
-                                      shell=shell_value,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE,
-                                      stdin=subprocess.PIPE)
-    create_process.communicate(input='\n' * 7)
+                  '-f', PrependTempDir(PRIVATE_KEYFILE)]
+    IssueCommand(create_cmd)
 
 
 def GetPrivateKeyPath():
@@ -168,11 +180,7 @@ def GetPublicKeyPath():
   return PrependTempDir(PUBLIC_KEYFILE)
 
 
-def GetCertPath():
-  return PrependTempDir(CERT_FILE)
-
-
-def GetSshOptions(ssh_key_filename, connect_timeout=5):
+def GetSshOptions(ssh_key_filename, connect_timeout=None):
   """Return common set of SSH and SCP options."""
   options = [
       '-2',
@@ -181,12 +189,23 @@ def GetSshOptions(ssh_key_filename, connect_timeout=5):
       '-o', 'IdentitiesOnly=yes',
       '-o', 'PreferredAuthentications=publickey',
       '-o', 'PasswordAuthentication=no',
-      '-o', 'ConnectTimeout=%d' % connect_timeout,
+      '-o', 'ConnectTimeout=%d' % (
+          connect_timeout or FLAGS.ssh_connect_timeout),
       '-o', 'GSSAPIAuthentication=no',
-      '-o', 'ServerAliveInterval=30',
-      '-o', 'ServerAliveCountMax=10',
+      '-o', 'ServerAliveInterval=%d' % FLAGS.ssh_server_alive_interval,
+      '-o', 'ServerAliveCountMax=%d' % FLAGS.ssh_server_alive_count_max,
       '-i', ssh_key_filename
   ]
+  if FLAGS.use_ipv6:
+    options.append('-6')
+  if FLAGS.ssh_reuse_connections:
+    control_path = (FLAGS.ssh_control_path or
+                    os.path.join(temp_dir.GetSshConnectionsDir(), '%h'))
+    options.extend([
+        '-o', 'ControlPath="%s"' % control_path,
+        '-o', 'ControlMaster=auto',
+        '-o', 'ControlPersist=%s' % FLAGS.ssh_control_persist
+    ])
   options.extend(FLAGS.ssh_options)
 
   return options
@@ -259,8 +278,21 @@ def Retry(poll_interval=POLL_INTERVAL, max_retries=MAX_RETRIES,
   return Wrap
 
 
+class _BoxedObject(object):
+  """Box a value in a reference so it is modifiable inside an inner function.
+
+  In python3 the nonlocal keyword could be used instead - but for python2
+  there is no support for modifying an external scoped variable value.
+  """
+
+  def __init__(self, initial_value):
+    self.value = initial_value
+
+
 def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
-                 env=None, timeout=DEFAULT_TIMEOUT, cwd=None):
+                 env=None, timeout=DEFAULT_TIMEOUT, cwd=None,
+                 raise_on_failure=True, suppress_failure=None,
+                 raise_on_timeout=True):
   """Tries running the provided command once.
 
   Args:
@@ -282,21 +314,36 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
         contain what had already been written to them before the process was
         killed.
     cwd: Directory in which to execute the command.
+    raise_on_failure: A boolean indicating if non-zero return codes should raise
+        IssueCommandError.
+    suppress_failure: A function passed (stdout, stderr, ret_code) for non-zero
+        return codes to determine if the failure should be suppressed e.g. a
+        delete command which fails because the item to be deleted does not
+        exist.
+    raise_on_timeout: A boolean indicating if killing the process due to the
+        timeout being hit should raise a IssueCommandTimeoutError
 
   Returns:
     A tuple of stdout, stderr, and retcode from running the provided command.
+
+  Raises:
+    IssueCommandError: When raise_on_failure=True and retcode is non-zero.
+    IssueCommandTimeoutError:  When raise_on_timeout=True and
+                               command duration exceeds timeout
   """
   if env:
-    logging.debug('Environment variables: %s' % env)
+    logging.debug('Environment variables: %s', env)
 
   full_cmd = ' '.join(cmd)
   logging.info('Running: %s', full_cmd)
 
   time_file_path = '/usr/bin/time'
 
-  runningOnWindows = RunningOnWindows()
-  should_time = not runningOnWindows and os.path.isfile(time_file_path)
-  shell_value = runningOnWindows
+  running_on_windows = RunningOnWindows()
+  running_on_darwin = RunningOnDarwin()
+  should_time = (not (running_on_windows or running_on_darwin) and
+                 os.path.isfile(time_file_path) and FLAGS.time_commands)
+  shell_value = running_on_windows
   with tempfile.TemporaryFile() as tf_out, \
       tempfile.TemporaryFile() as tf_err, \
       tempfile.NamedTemporaryFile(mode='r') as tf_timing:
@@ -312,10 +359,16 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
                                stdin=subprocess.PIPE, stdout=tf_out,
                                stderr=tf_err, cwd=cwd)
 
+    did_timeout = _BoxedObject(False)
+    was_killed = _BoxedObject(False)
+
     def _KillProcess():
-      logging.error('IssueCommand timed out after %d seconds. '
-                    'Killing command "%s".', timeout, full_cmd)
+      did_timeout.value = True
+      if not raise_on_timeout:
+        logging.warning('IssueCommand timed out after %d seconds. '
+                        'Killing command "%s".', timeout, full_cmd)
       process.kill()
+      was_killed.value = True
 
     timer = threading.Timer(timeout, _KillProcess)
     timer.start()
@@ -334,12 +387,32 @@ def IssueCommand(cmd, force_info_log=False, suppress_warning=False,
     if should_time:
       timing_output = tf_timing.read().rstrip('\n')
 
-  debug_text = ('Ran: {%s}  ReturnCode:%s%s\nSTDOUT: %s\nSTDERR: %s' %
+  debug_text = ('Ran: {%s}\nReturnCode:%s%s\nSTDOUT: %s\nSTDERR: %s' %
                 (full_cmd, process.returncode, timing_output, stdout, stderr))
   if force_info_log or (process.returncode and not suppress_warning):
     logging.info(debug_text)
   else:
     logging.debug(debug_text)
+
+  # Raise timeout error regardless of raise_on_failure - as the intended
+  # semantics is to ignore expected errors caused by invoking the command
+  # not errors from PKB infrastructure.
+  if did_timeout.value and raise_on_timeout:
+    debug_text = (
+        '{0}\nIssueCommand timed out after {1} seconds.  '
+        '{2} by perfkitbenchmarker.'.format(
+            debug_text, timeout,
+            'Process was killed' if was_killed.value else
+            'Process may have been killed'))
+    raise errors.VmUtil.IssueCommandTimeoutError(debug_text)
+  elif process.returncode and (raise_on_failure or suppress_failure):
+    if (suppress_failure and
+        suppress_failure(stdout, stderr, process.returncode)):
+      # failure is suppressible, rewrite the stderr and return code as passing
+      # since some callers assume either is a failure e.g.
+      # perfkitbenchmarker.providers.aws.util.IssueRetryableCommand()
+      return stdout, '', 0
+    raise errors.VmUtil.IssueCommandError(debug_text)
 
   return stdout, stderr, process.returncode
 
@@ -354,7 +427,7 @@ def IssueBackgroundCommand(cmd, stdout_path, stderr_path, env=None):
     env: A dict of key/value strings, such as is given to the subprocess.Popen()
         constructor, that contains environment variables to be injected.
   """
-  logging.debug('Environment variables: %s' % env)
+  logging.debug('Environment variables: %s', env)
 
   full_cmd = ' '.join(cmd)
   logging.info('Spawning: %s', full_cmd)
@@ -377,10 +450,12 @@ def IssueRetryableCommand(cmd, env=None):
   Returns:
     A tuple of stdout and stderr from running the provided command.
   """
-  stdout, stderr, retcode = IssueCommand(cmd, env=env)
+  stdout, stderr, retcode = IssueCommand(cmd, env=env, raise_on_failure=False)
   if retcode:
+    debug_text = ('Ran: {%s}\nReturnCode:%s\nSTDOUT: %s\nSTDERR: %s' %
+                  (' '.join(cmd), retcode, stdout, stderr))
     raise errors.VmUtil.CalledProcessException(
-        'Command returned a non-zero exit code.\n')
+        'Command returned a non-zero exit code:\n{}'.format(debug_text))
   return stdout, stderr
 
 
@@ -402,15 +477,14 @@ def ParseTimeCommandResult(command_result):
   return time_in_seconds
 
 
-
-def ShouldRunOnExternalIpAddress():
+def ShouldRunOnExternalIpAddress(ip_type=None):
   """Returns whether a test should be run on an instance's external IP."""
-  return FLAGS.ip_addresses in (IpAddressSubset.EXTERNAL,
-                                IpAddressSubset.BOTH,
-                                IpAddressSubset.REACHABLE)
+  ip_type_to_check = ip_type or FLAGS.ip_addresses
+  return ip_type_to_check in (IpAddressSubset.EXTERNAL, IpAddressSubset.BOTH,
+                              IpAddressSubset.REACHABLE)
 
 
-def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm):
+def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm, ip_type=None):
   """Returns whether a test should be run on an instance's internal IP.
 
   Based on the command line flag --ip_addresses. Internal IP addresses are used
@@ -423,14 +497,15 @@ def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm):
   Args:
     sending_vm: VirtualMachine. The client.
     receiving_vm: VirtualMachine. The server.
+    ip_type: optional ip_type to use instead of what is set in the FLAGS
 
   Returns:
     Whether a test should be run on an instance's internal IP.
   """
-  return (FLAGS.ip_addresses in (IpAddressSubset.BOTH,
-                                 IpAddressSubset.INTERNAL) or
-          (FLAGS.ip_addresses == IpAddressSubset.REACHABLE and
-           sending_vm.IsReachable(receiving_vm)))
+  ip_type_to_check = ip_type or FLAGS.ip_addresses
+  return (ip_type_to_check in (IpAddressSubset.BOTH, IpAddressSubset.INTERNAL)
+          or (ip_type_to_check == IpAddressSubset.REACHABLE and
+              sending_vm.IsReachable(receiving_vm)))
 
 
 def GetLastRunUri():
@@ -452,7 +527,8 @@ def GetLastRunUri():
 
 
 @contextlib.contextmanager
-def NamedTemporaryFile(prefix='tmp', suffix='', dir=None, delete=True):
+def NamedTemporaryFile(mode='w+b', prefix='tmp', suffix='', dir=None,
+                       delete=True):
   """Behaves like tempfile.NamedTemporaryFile.
 
   The existing tempfile.NamedTemporaryFile has the annoying property on
@@ -461,8 +537,18 @@ def NamedTemporaryFile(prefix='tmp', suffix='', dir=None, delete=True):
   compatible way. This serves a similar role, but allows the file to be closed
   within a "with" statement without causing the file to be unlinked until the
   context exits.
+
+  Args:
+    mode: see mode in tempfile.NamedTemporaryFile.
+    prefix: see prefix in tempfile.NamedTemporaryFile.
+    suffix: see suffix in tempfile.NamedTemporaryFile.
+    dir: see dir in tempfile.NamedTemporaryFile.
+    delete: see delete in NamedTemporaryFile.
+
+  Yields:
+    A cross platform file-like object which is "with" compatible.
   """
-  f = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix,
+  f = tempfile.NamedTemporaryFile(mode=mode, prefix=prefix, suffix=suffix,
                                   dir=dir, delete=False)
   try:
     yield f
@@ -507,6 +593,11 @@ def RunningOnWindows():
   return os.name == WINDOWS
 
 
+def RunningOnDarwin():
+  """Returns True if PKB is running on a Darwin OS machine."""
+  return os.name != WINDOWS and platform.system() == DARWIN
+
+
 def ExecutableOnPath(executable_name):
   """Return True if the given executable can be found on the path."""
   cmd = ['where'] if RunningOnWindows() else ['which']
@@ -531,16 +622,17 @@ def GenerateRandomWindowsPassword(password_length=PASSWORD_LENGTH):
   # that we can safely use. See
   # https://github.com/Azure/azure-xplat-cli/blob/master/lib/commands/arm/vm/vmOsProfile._js#L145
   special_chars = '*!@#$%+='
+  # Ensure that the password contains at least one of each 4 required
+  # character types starting with letters to avoid starting with chars which
+  # are problematic on the command line e.g. @.
+  prefix = [random.choice(string.ascii_lowercase),
+            random.choice(string.ascii_uppercase),
+            random.choice(string.digits),
+            random.choice(special_chars)]
   password = [
       random.choice(string.ascii_letters + string.digits + special_chars)
       for _ in range(password_length - 4)]
-  # Ensure that the password contains at least one of each 4 required
-  # character types.
-  password.append(random.choice(string.ascii_lowercase))
-  password.append(random.choice(string.ascii_uppercase))
-  password.append(random.choice(string.digits))
-  password.append(random.choice(special_chars))
-  return ''.join(password)
+  return ''.join(prefix + password)
 
 
 def StartSimulatedMaintenance():
@@ -559,3 +651,38 @@ def SetupSimulatedMaintenance(vm):
     t = threading.Thread(target=_SimulateMaintenance)
     t.daemon = True
     t.start()
+
+
+def CopyFileBetweenVms(filename, src_vm, src_path, dest_vm, dest_path):
+  """Copies a file from the src_vm to the dest_vm."""
+  with tempfile.NamedTemporaryFile() as tf:
+    temp_path = tf.name
+    src_vm.RemoteCopy(
+        temp_path, os.path.join(src_path, filename), copy_to=False)
+    dest_vm.RemoteCopy(
+        temp_path, os.path.join(dest_path, filename), copy_to=True)
+
+
+def ReplaceText(vm, current_value, new_value, file_name, regex_char='/'):
+  """Replaces text <current_value> with <new_value> in remote <file_name>."""
+  vm.RemoteCommand('sed -i -r "s{regex_char}{current_value}{regex_char}'
+                   '{new_value}{regex_char}" {file}'.format(
+                       regex_char=regex_char,
+                       current_value=current_value,
+                       new_value=new_value,
+                       file=file_name))
+
+
+def DictonaryToEnvString(dictionary):
+  """Convert a dictionary to a space sperated 'key=value' string.
+
+  Args:
+    dictionary: the key-value dictionary to be convert
+
+  Returns:
+    a string representing the dictionary
+  """
+  dict_str = ''
+  for key, value in sorted(dictionary.items()):
+    dict_str += ' {key}={value}'.format(key=key, value=value)
+  return dict_str

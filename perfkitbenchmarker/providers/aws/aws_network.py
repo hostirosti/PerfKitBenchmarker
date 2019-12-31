@@ -24,16 +24,25 @@ for more information about AWS Virtual Private Clouds.
 import json
 import logging
 import threading
-import uuid
 
 from perfkitbenchmarker import context
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import network
+from perfkitbenchmarker import providers
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.providers.aws import aws_placement_group
 from perfkitbenchmarker.providers.aws import util
-from perfkitbenchmarker import providers
+
+flags.DEFINE_string('aws_vpc', None,
+                    'The static AWS VPC id to use. Default creates a new one')
+flags.DEFINE_string(
+    'aws_subnet', None,
+    'The static AWS subnet id to use.  Default creates a new one')
+flags.DEFINE_bool('aws_efa', False, 'Whether to use an Elastic Fiber Adapter.')
+flags.DEFINE_string('aws_efa_version', '1.7.0',
+                    'Version of AWS EFA to use (must also pass in --aws_efa).')
 
 FLAGS = flags.FLAGS
 
@@ -51,7 +60,7 @@ class AwsFirewall(network.BaseFirewall):
     self.firewall_set = set()
     self._lock = threading.Lock()
 
-  def AllowPort(self, vm, start_port, end_port=None):
+  def AllowPort(self, vm, start_port, end_port=None, source_range=None):
     """Opens a port on the firewall.
 
     Args:
@@ -59,13 +68,20 @@ class AwsFirewall(network.BaseFirewall):
       start_port: The first local port to open in a range.
       end_port: The last local port to open in a range. If None, only start_port
         will be opened.
+      source_range: List of source CIDRs to allow for this port. If None, all
+        sources are allowed. i.e. ['0.0.0.0/0']
     """
-    if vm.is_static:
+    if vm.is_static or vm.network.is_static:
       return
-    self.AllowPortInSecurityGroup(vm.region, vm.group_id, start_port, end_port)
+    self.AllowPortInSecurityGroup(vm.region, vm.group_id, start_port, end_port,
+                                  source_range)
 
-  def AllowPortInSecurityGroup(self, region, security_group,
-                               start_port, end_port=None):
+  def AllowPortInSecurityGroup(self,
+                               region,
+                               security_group,
+                               start_port,
+                               end_port=None,
+                               source_range=None):
     """Opens a port on the firewall for a security group.
 
     Args:
@@ -74,27 +90,48 @@ class AwsFirewall(network.BaseFirewall):
       start_port: The first local port to open in a range.
       end_port: The last local port to open in a range. If None, only start_port
         will be opened.
+      source_range: List of source CIDRs to allow for this port.
     """
-    if end_port is None:
-      end_port = start_port
-    entry = (start_port, end_port, region, security_group)
-    if entry in self.firewall_set:
-      return
-    with self._lock:
+    end_port = end_port or start_port
+    source_range = source_range or ['0.0.0.0/0']
+    for source in source_range:
+      entry = (start_port, end_port, region, security_group, source)
       if entry in self.firewall_set:
-        return
-      authorize_cmd = util.AWS_PREFIX + [
-          'ec2',
-          'authorize-security-group-ingress',
-          '--region=%s' % region,
-          '--group-id=%s' % security_group,
-          '--port=%s-%s' % (start_port, end_port),
-          '--cidr=0.0.0.0/0']
-      util.IssueRetryableCommand(
-          authorize_cmd + ['--protocol=tcp'])
-      util.IssueRetryableCommand(
-          authorize_cmd + ['--protocol=udp'])
-      self.firewall_set.add(entry)
+        continue
+      if self._RuleExists(region, security_group, start_port, end_port, source):
+        self.firewall_set.add(entry)
+        continue
+      with self._lock:
+        if entry in self.firewall_set:
+          continue
+        authorize_cmd = util.AWS_PREFIX + [
+            'ec2',
+            'authorize-security-group-ingress',
+            '--region=%s' % region,
+            '--group-id=%s' % security_group,
+            '--port=%s-%s' % (start_port, end_port),
+            '--cidr=%s' % source,
+        ]
+        util.IssueRetryableCommand(authorize_cmd + ['--protocol=tcp'])
+        util.IssueRetryableCommand(authorize_cmd + ['--protocol=udp'])
+        self.firewall_set.add(entry)
+
+  def _RuleExists(self, region, security_group, start_port, end_port, source):
+    """Whether the firewall rule exists in the VPC."""
+    query_cmd = util.AWS_PREFIX + [
+        'ec2',
+        'describe-security-groups',
+        '--region=%s' % region,
+        '--group-ids=%s' % security_group,
+        '--filters',
+        'Name=ip-permission.cidr,Values={}'.format(source),
+        'Name=ip-permission.from-port,Values={}'.format(start_port),
+        'Name=ip-permission.to-port,Values={}'.format(end_port),
+    ]
+    stdout, _ = util.IssueRetryableCommand(query_cmd)
+    # "groups" will be an array of all the matching firewall rules
+    groups = json.loads(stdout)['SecurityGroups']
+    return bool(groups)
 
   def DisallowAllPorts(self):
     """Closes all ports on the firewall."""
@@ -104,17 +141,18 @@ class AwsFirewall(network.BaseFirewall):
 class AwsVpc(resource.BaseResource):
   """An object representing an Aws VPC."""
 
-  def __init__(self, region):
-    super(AwsVpc, self).__init__()
+  def __init__(self, region, vpc_id=None):
+    super(AwsVpc, self).__init__(vpc_id is not None)
     self.region = region
-    self.id = None
-
+    self.id = vpc_id
     # Subnets are assigned per-AZ.
     # _subnet_index tracks the next unused 10.0.x.0/24 block.
     self._subnet_index = 0
     # Lock protecting _subnet_index
     self._subnet_index_lock = threading.Lock()
     self.default_security_group_id = None
+    if self.id:
+      self._SetSecurityGroupId()
 
   def _Create(self):
     """Creates the VPC."""
@@ -130,23 +168,31 @@ class AwsVpc(resource.BaseResource):
     util.AddDefaultTags(self.id, self.region)
 
   def _PostCreate(self):
+    self._SetSecurityGroupId()
+
+  def _SetSecurityGroupId(self):
     """Looks up the VPC default security group."""
+    groups = self.GetSecurityGroups('default')
+    if len(groups) != 1:
+      raise ValueError('Expected one security group, got {} in {}'.format(
+          len(groups), groups))
+    self.default_security_group_id = groups[0]['GroupId']
+    logging.info('Default security group ID: %s',
+                 self.default_security_group_id)
+    if FLAGS.aws_efa:
+      self._AllowSelfOutBound()
+
+  def GetSecurityGroups(self, group_name=None):
     cmd = util.AWS_PREFIX + [
         'ec2',
         'describe-security-groups',
         '--region', self.region,
         '--filters',
-        'Name=group-name,Values=default',
         'Name=vpc-id,Values=' + self.id]
+    if group_name:
+      cmd.append('Name=group-name,Values={}'.format(group_name))
     stdout, _, _ = vm_util.IssueCommand(cmd)
-    response = json.loads(stdout)
-    groups = response['SecurityGroups']
-    if len(groups) != 1:
-      raise ValueError('Expected one security group, got {} in {}'.format(
-          len(groups), response))
-    self.default_security_group_id = groups[0]['GroupId']
-    logging.info('Default security group ID: %s',
-                 self.default_security_group_id)
+    return json.loads(stdout)['SecurityGroups']
 
   def _Exists(self):
     """Returns true if the VPC exists."""
@@ -186,7 +232,7 @@ class AwsVpc(resource.BaseResource):
         'delete-vpc',
         '--region=%s' % self.region,
         '--vpc-id=%s' % self.id]
-    vm_util.IssueCommand(delete_cmd)
+    vm_util.IssueCommand(delete_cmd, raise_on_failure=False)
 
   def NextSubnetCidrBlock(self):
     """Returns the next available /24 CIDR block in this VPC.
@@ -208,16 +254,34 @@ class AwsVpc(resource.BaseResource):
       self._subnet_index += 1
     return cidr
 
+  @vm_util.Retry()
+  def _AllowSelfOutBound(self):
+    """Allow outbound connections on all ports in the default security group.
+
+    Details: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html
+    """
+    cmd = util.AWS_PREFIX + [
+        'ec2', 'authorize-security-group-egress',
+        '--region', self.region, '--group-id', self.default_security_group_id,
+        '--protocol', 'all', '--source-group', self.default_security_group_id
+    ]
+    try:
+      vm_util.IssueCommand(cmd)
+    except errors.VmUtil.IssueCommandError as ex:
+      # do not retry if this rule already exists
+      if ex.message.find('InvalidPermission.Duplicate') == -1:
+        raise ex
+
 
 class AwsSubnet(resource.BaseResource):
   """An object representing an Aws subnet."""
 
-  def __init__(self, zone, vpc_id, cidr_block='10.0.0.0/24'):
-    super(AwsSubnet, self).__init__()
+  def __init__(self, zone, vpc_id, cidr_block='10.0.0.0/24', subnet_id=None):
+    super(AwsSubnet, self).__init__(subnet_id is not None)
     self.zone = zone
     self.region = util.GetRegionFromZone(zone)
     self.vpc_id = vpc_id
-    self.id = None
+    self.id = subnet_id
     self.cidr_block = cidr_block
 
   def _Create(self):
@@ -247,31 +311,49 @@ class AwsSubnet(resource.BaseResource):
         'delete-subnet',
         '--region=%s' % self.region,
         '--subnet-id=%s' % self.id]
-    vm_util.IssueCommand(delete_cmd)
+    vm_util.IssueCommand(delete_cmd, raise_on_failure=False)
 
   def _Exists(self):
     """Returns true if the subnet exists."""
+    return bool(self.GetDict())
+
+  def GetDict(self):
+    """The 'aws ec2 describe-subnets' for this VPC / subnet id.
+
+    Returns:
+      A dict of the single subnet or an empty dict if there are no subnets.
+
+    Raises:
+      AssertionError: If there is more than one subnet.
+    """
     describe_cmd = util.AWS_PREFIX + [
-        'ec2',
-        'describe-subnets',
+        'ec2', 'describe-subnets',
         '--region=%s' % self.region,
-        '--filter=Name=subnet-id,Values=%s' % self.id]
+        '--filter=Name=vpc-id,Values=%s' % self.vpc_id
+    ]
+    if self.id:
+      describe_cmd.append('--filter=Name=subnet-id,Values=%s' % self.id)
     stdout, _ = util.IssueRetryableCommand(describe_cmd)
     response = json.loads(stdout)
     subnets = response['Subnets']
     assert len(subnets) < 2, 'Too many subnets.'
-    return len(subnets) > 0
+    return subnets[0] if subnets else {}
 
 
 class AwsInternetGateway(resource.BaseResource):
   """An object representing an Aws Internet Gateway."""
 
-  def __init__(self, region):
-    super(AwsInternetGateway, self).__init__()
+  def __init__(self, region, vpc_id=None):
+    super(AwsInternetGateway, self).__init__(vpc_id is not None)
     self.region = region
     self.vpc_id = None
     self.id = None
     self.attached = False
+    if vpc_id:
+      self.vpc_id = vpc_id
+      self.id = self.GetDict().get('InternetGatewayId')
+      # if a gateway was found then it is attached to this VPC
+      self.attached = bool(self.id)
 
   def _Create(self):
     """Creates the internet gateway."""
@@ -291,23 +373,47 @@ class AwsInternetGateway(resource.BaseResource):
         'delete-internet-gateway',
         '--region=%s' % self.region,
         '--internet-gateway-id=%s' % self.id]
-    vm_util.IssueCommand(delete_cmd)
+    vm_util.IssueCommand(delete_cmd, raise_on_failure=False)
 
   def _Exists(self):
     """Returns true if the internet gateway exists."""
+    return bool(self.GetDict())
+
+  def GetDict(self):
+    """The 'aws ec2 describe-internet-gateways' for this VPC / gateway id.
+
+    Returns:
+      A dict of the single gateway or an empty dict if there are no gateways.
+
+    Raises:
+      AssertionError: If there is more than one internet gateway.
+    """
     describe_cmd = util.AWS_PREFIX + [
         'ec2',
         'describe-internet-gateways',
         '--region=%s' % self.region,
-        '--filter=Name=internet-gateway-id,Values=%s' % self.id]
+    ]
+    if self.id:
+      describe_cmd.append('--filter=Name=internet-gateway-id,Values=%s' %
+                          self.id)
+    elif self.vpc_id:
+      # Only query with self.vpc_id if the self.id is NOT set -- after calling
+      # Detach() this object will set still have a vpc_id but will be filtered
+      # out in a query if using attachment.vpc-id.
+      # Using self.vpc_id instead of self.attached as the init phase always
+      # sets it to False.
+      describe_cmd.append('--filter=Name=attachment.vpc-id,Values=%s' %
+                          self.vpc_id)
+    else:
+      raise errors.Error('Must have a VPC id or a gateway id')
     stdout, _ = util.IssueRetryableCommand(describe_cmd)
     response = json.loads(stdout)
     internet_gateways = response['InternetGateways']
     assert len(internet_gateways) < 2, 'Too many internet gateways.'
-    return len(internet_gateways) > 0
+    return internet_gateways[0] if internet_gateways else {}
 
   def Attach(self, vpc_id):
-    """Attaches the internetgateway to the VPC."""
+    """Attaches the internet gateway to the VPC."""
     if not self.attached:
       self.vpc_id = vpc_id
       attach_cmd = util.AWS_PREFIX + [
@@ -320,15 +426,24 @@ class AwsInternetGateway(resource.BaseResource):
       self.attached = True
 
   def Detach(self):
-    """Detaches the internetgateway from the VPC."""
-    if self.attached:
+    """Detaches the internet gateway from the VPC."""
+
+    def _suppress_failure(stdout, stderr, retcode):
+      """Suppresses Detach failure when internet gateway is in a bad state."""
+      del stdout  # unused
+      if retcode and ('InvalidInternetGatewayID.NotFound' in stderr or
+                      'Gateway.NotAttached' in stderr):
+        return True
+      return False
+
+    if self.attached and not self.user_managed:
       detach_cmd = util.AWS_PREFIX + [
           'ec2',
           'detach-internet-gateway',
           '--region=%s' % self.region,
           '--internet-gateway-id=%s' % self.id,
           '--vpc-id=%s' % self.vpc_id]
-      util.IssueRetryableCommand(detach_cmd)
+      util.IssueRetryableCommand(detach_cmd, suppress_failure=_suppress_failure)
       self.attached = False
 
 
@@ -357,17 +472,33 @@ class AwsRouteTable(resource.BaseResource):
   @vm_util.Retry()
   def _PostCreate(self):
     """Gets data about the route table."""
+    self.id = self.GetDict()[0]['RouteTableId']
+
+  def GetDict(self):
+    """Returns an array of the currently existing routes for this VPC."""
     describe_cmd = util.AWS_PREFIX + [
         'ec2',
         'describe-route-tables',
         '--region=%s' % self.region,
         '--filters=Name=vpc-id,Values=%s' % self.vpc_id]
     stdout, _ = util.IssueRetryableCommand(describe_cmd)
-    response = json.loads(stdout)
-    self.id = response['RouteTables'][0]['RouteTableId']
+    return json.loads(stdout)['RouteTables']
+
+  def RouteExists(self):
+    """Returns true if the 0.0.0.0/0 route already exists."""
+    route_tables = self.GetDict()
+    if not route_tables:
+      return False
+    for route in route_tables[0].get('Routes', []):
+      if route.get('DestinationCidrBlock') == '0.0.0.0/0':
+        return True
+    return False
 
   def CreateRoute(self, internet_gateway_id):
     """Adds a route to the internet gateway."""
+    if self.RouteExists():
+      logging.info('Internet route already exists.')
+      return
     create_cmd = util.AWS_PREFIX + [
         'ec2',
         'create-route',
@@ -376,58 +507,6 @@ class AwsRouteTable(resource.BaseResource):
         '--gateway-id=%s' % internet_gateway_id,
         '--destination-cidr-block=0.0.0.0/0']
     util.IssueRetryableCommand(create_cmd)
-
-
-class AwsPlacementGroup(resource.BaseResource):
-  """Object representing an AWS Placement Group.
-
-  Attributes:
-    region: The AWS region the Placement Group is in.
-    name: The name of the Placement Group.
-  """
-
-  def __init__(self, region):
-    """Init method for AwsPlacementGroup.
-
-    Args:
-      region: A string containing the AWS region of the Placement Group.
-    """
-    super(AwsPlacementGroup, self).__init__()
-    self.name = (
-        'perfkit-%s-%s' % (FLAGS.run_uri, str(uuid.uuid4())[-12:]))
-    self.region = region
-
-  def _Create(self):
-    """Creates the Placement Group."""
-    create_cmd = util.AWS_PREFIX + [
-        'ec2',
-        'create-placement-group',
-        '--region=%s' % self.region,
-        '--group-name=%s' % self.name,
-        '--strategy=cluster']
-    vm_util.IssueCommand(create_cmd)
-
-  def _Delete(self):
-    """Deletes the Placement Group."""
-    delete_cmd = util.AWS_PREFIX + [
-        'ec2',
-        'delete-placement-group',
-        '--region=%s' % self.region,
-        '--group-name=%s' % self.name]
-    vm_util.IssueCommand(delete_cmd)
-
-  def _Exists(self):
-    """Returns true if the Placement Group exists."""
-    describe_cmd = util.AWS_PREFIX + [
-        'ec2',
-        'describe-placement-groups',
-        '--region=%s' % self.region,
-        '--filter=Name=group-name,Values=%s' % self.name]
-    stdout, _ = util.IssueRetryableCommand(describe_cmd)
-    response = json.loads(stdout)
-    placement_groups = response['PlacementGroups']
-    assert len(placement_groups) < 2, 'Too many placement groups.'
-    return len(placement_groups) > 0
 
 
 class _AwsRegionalNetwork(network.BaseNetwork):
@@ -443,10 +522,15 @@ class _AwsRegionalNetwork(network.BaseNetwork):
     route_table: an AwsRouteTable instance. The default route table.
   """
 
-  def __init__(self, region):
+  CLOUD = providers.AWS
+
+  def __repr__(self):
+    return '%s(%r)' % (self.__class__, self.__dict__)
+
+  def __init__(self, region, vpc_id=None):
     self.region = region
-    self.vpc = AwsVpc(self.region)
-    self.internet_gateway = AwsInternetGateway(region)
+    self.vpc = AwsVpc(self.region, vpc_id)
+    self.internet_gateway = AwsInternetGateway(region, vpc_id)
     self.route_table = None
     self.created = False
 
@@ -461,11 +545,12 @@ class _AwsRegionalNetwork(network.BaseNetwork):
     self._reference_count_lock = threading.Lock()
 
   @classmethod
-  def GetForRegion(cls, region):
+  def GetForRegion(cls, region, vpc_id=None):
     """Retrieves or creates an _AwsRegionalNetwork.
 
     Args:
       region: string. AWS region name.
+      vpc_id: string. AWS VPC id.
 
     Returns:
       _AwsRegionalNetwork. If an _AwsRegionalNetwork for the same region already
@@ -481,7 +566,7 @@ class _AwsRegionalNetwork(network.BaseNetwork):
     # is only called from AwsNetwork.GetNetwork, we already hold the
     # benchmark_spec.networks_lock.
     if key not in benchmark_spec.networks:
-      benchmark_spec.networks[key] = cls(region)
+      benchmark_spec.networks[key] = cls(region, vpc_id)
     return benchmark_spec.networks[key]
 
   def Create(self):
@@ -523,29 +608,73 @@ class _AwsRegionalNetwork(network.BaseNetwork):
     self.vpc.Delete()
 
 
+class AwsNetworkSpec(network.BaseNetworkSpec):
+  """Configuration for creating an AWS network."""
+
+  def __init__(self, zone, vpc_id=None, subnet_id=None):
+    super(AwsNetworkSpec, self).__init__(zone)
+    if vpc_id or subnet_id:
+      logging.info('Confirming vpc (%s) and subnet (%s) selections', vpc_id,
+                   subnet_id)
+      my_subnet = AwsSubnet(self.zone, vpc_id, subnet_id=subnet_id).GetDict()
+      self.vpc_id = my_subnet['VpcId']
+      self.subnet_id = my_subnet['SubnetId']
+      self.cidr_block = my_subnet['CidrBlock']
+      logging.info('Using vpc %s subnet %s cidr %s', self.vpc_id,
+                   self.subnet_id, self.cidr_block)
+    else:
+      self.vpc_id = None
+      self.subnet_id = None
+      self.cidr_block = None
+
+
 class AwsNetwork(network.BaseNetwork):
   """Object representing an AWS Network.
 
   Attributes:
     region: The AWS region the Network is in.
-    regional_network: The AwsRegionalNetwor for 'region'.
+    regional_network: The AwsRegionalNetwork for 'region'.
     subnet: the AwsSubnet for this zone.
     placement_group: An AwsPlacementGroup instance.
   """
 
   CLOUD = providers.AWS
 
+  def __repr__(self):
+    return '%s(%r)' % (self.__class__, self.__dict__)
+
   def __init__(self, spec):
     """Initializes AwsNetwork instances.
 
     Args:
-      spec: A BaseNetworkSpec object.
+      spec: An AwsNetworkSpec object.
     """
     super(AwsNetwork, self).__init__(spec)
     self.region = util.GetRegionFromZone(spec.zone)
-    self.regional_network = _AwsRegionalNetwork.GetForRegion(self.region)
+    self.regional_network = _AwsRegionalNetwork.GetForRegion(
+        self.region, spec.vpc_id)
     self.subnet = None
-    self.placement_group = AwsPlacementGroup(self.region)
+    if (FLAGS.aws_placement_group_style ==
+        aws_placement_group.PLACEMENT_GROUP_NONE):
+      self.placement_group = None
+    else:
+      placement_group_spec = aws_placement_group.AwsPlacementGroupSpec(
+          'AwsPlacementGroupSpec', flag_values=FLAGS, zone=spec.zone)
+      self.placement_group = aws_placement_group.AwsPlacementGroup(
+          placement_group_spec)
+    self.is_static = False
+    if spec.vpc_id:
+      self.is_static = True
+      self.subnet = AwsSubnet(
+          self.zone,
+          spec.vpc_id,
+          cidr_block=spec.cidr_block,
+          subnet_id=spec.subnet_id)
+
+  @staticmethod
+  def _GetNetworkSpecFromVm(vm):
+    """Returns an AwsNetworkSpec created from VM attributes and flags."""
+    return AwsNetworkSpec(vm.zone, FLAGS.aws_vpc, FLAGS.aws_subnet)
 
   def Create(self):
     """Creates the network."""
@@ -556,13 +685,15 @@ class AwsNetwork(network.BaseNetwork):
       self.subnet = AwsSubnet(self.zone, self.regional_network.vpc.id,
                               cidr_block=cidr)
       self.subnet.Create()
-    self.placement_group.Create()
+    if self.placement_group:
+      self.placement_group.Create()
 
   def Delete(self):
     """Deletes the network."""
     if self.subnet:
       self.subnet.Delete()
-    self.placement_group.Delete()
+    if self.placement_group:
+      self.placement_group.Delete()
     self.regional_network.Delete()
 
   @classmethod

@@ -22,10 +22,24 @@ added after installation.
 from perfkitbenchmarker.linux_packages import INSTALL_DIR
 
 
-def _Install(vm, package_name='python-pip'):
+def Install(vm, package_name='python-pip'):
   """Install pip on the VM."""
   vm.InstallPackages(package_name)
-  vm.RemoteCommand('sudo pip install -U pip')  # Make pip upgrade pip
+  if vm.PYTHON_PIP_PACKAGE_VERSION:
+    vm.RemoteCommand(
+        'sudo pip install --upgrade '
+        '--force-reinstall pip=={0}'.format(vm.PYTHON_PIP_PACKAGE_VERSION))
+  else:
+    vm.RemoteCommand('sudo pip install -U pip')  # Make pip upgrade pip
+
+  # Add a symbolic link to /usr/local/bin/pip if pip ends up there. This lets
+  # us run pip under sudo since /usr/local/bin is not typically available to
+  # sudo.
+  if not vm.TryRemoteCommand('sudo which pip'):
+    pip_location, _ = vm.RemoteCommand('which pip')
+    if pip_location.startswith('/usr/local/bin/pip'):
+      vm.RemoteCommand('sudo ln -s /usr/local/bin/pip /usr/bin/pip')
+
   vm.RemoteCommand('mkdir -p {0} && pip freeze > {0}/requirements.txt'.format(
       INSTALL_DIR))
 
@@ -34,27 +48,19 @@ def YumInstall(vm):
   """Installs the pip package on the VM."""
   vm.InstallEpelRepo()
   package_name = getattr(vm, 'python_pip_package_config', 'python27-pip')
-  _Install(vm, package_name)
+  Install(vm, package_name)
 
 
-def AptInstall(vm):
-  """Installs the pip package on the VM."""
-  _Install(vm)
+def SwupdInstall(vm):
+  """Installs the pip package on the VM,"""
+  vm.InstallPackages("which")
+  package_name = "python-basic"
+  Install(vm, package_name)
 
 
-def _Uninstall(vm):
+def Uninstall(vm):
   """Uninstalls the pip package on the VM."""
   vm.RemoteCommand('pip freeze | grep --fixed-strings --line-regexp '
                    '--invert-match --file {0}/requirements.txt | '
                    'xargs --no-run-if-empty sudo pip uninstall -y'.format(
                        INSTALL_DIR))
-
-
-def YumUninstall(vm):
-  """Uninstalls the pip package on the VM."""
-  _Uninstall(vm)
-
-
-def AptUninstall(vm):
-  """Uninstalls the pip package on the VM."""
-  _Uninstall(vm)

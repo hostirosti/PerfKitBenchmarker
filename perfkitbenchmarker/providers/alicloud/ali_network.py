@@ -19,6 +19,10 @@ others in the
 same project. See https://developers.google.com/compute/docs/networking for
 more information about AliCloud VM networking.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import json
 import logging
 import threading
@@ -30,6 +34,7 @@ from perfkitbenchmarker import providers
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.alicloud import util
+from six.moves import range
 
 FLAGS = flags.FLAGS
 MAX_NAME_LENGTH = 128
@@ -53,7 +58,7 @@ class AliVpc(resource.BaseResource):
         '--RegionId %s' % self.region,
         '--CidrBlock 10.0.0.0/16']
     create_cmd = util.GetEncodedCmd(create_cmd)
-    stdout, _, _ = vm_util.IssueCommand(create_cmd)
+    stdout, _, _ = vm_util.IssueCommand(create_cmd, raise_on_failure=False)
     response = json.loads(stdout)
     self.id = response['VpcId']
 
@@ -97,7 +102,7 @@ class AliVpc(resource.BaseResource):
         '--RegionId %s' % self.region,
         '--VpcId %s' % self.id]
     delete_cmd = util.GetEncodedCmd(delete_cmd)
-    vm_util.IssueCommand(delete_cmd)
+    vm_util.IssueCommand(delete_cmd, raise_on_failure=False)
 
 
 class AliVSwitch(resource.BaseResource):
@@ -123,7 +128,7 @@ class AliVSwitch(resource.BaseResource):
         '--VpcId %s' % self.vpc_id,
     ]
     create_cmd = util.GetEncodedCmd(create_cmd)
-    stdout, _, _ = vm_util.IssueCommand(create_cmd)
+    stdout, _, _ = vm_util.IssueCommand(create_cmd, raise_on_failure=False)
     response = json.loads(stdout)
     self.id = response['VSwitchId']
 
@@ -135,7 +140,7 @@ class AliVSwitch(resource.BaseResource):
         '--RegionId %s' % self.region,
         '--VSwitchId %s' % self.id]
     delete_cmd = util.GetEncodedCmd(delete_cmd)
-    vm_util.IssueCommand(delete_cmd)
+    vm_util.IssueCommand(delete_cmd, raise_on_failure=False)
 
   def _Exists(self):
     """Returns true if the VSwitch exists."""
@@ -234,7 +239,7 @@ class AliFirewall(network.BaseFirewall):
       authorize_cmd = util.GetEncodedCmd(authorize_cmd)
       vm_util.IssueRetryableCommand(authorize_cmd)
 
-  def AllowPort(self, vm, start_port, end_port=None):
+  def AllowPort(self, vm, start_port, end_port=None, source_range=None):
     """Opens a port on the firewall.
 
     Args:
@@ -242,6 +247,7 @@ class AliFirewall(network.BaseFirewall):
       start_port: The first local port in a range of ports to open.
       end_port: The last port in a range of ports to open. If None, only
         start_port will be opened.
+      source_range: unsupported at present.
     """
 
     if not end_port:

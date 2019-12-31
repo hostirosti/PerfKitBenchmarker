@@ -13,22 +13,28 @@
 # limitations under the License.
 
 """Module containing fio installation, cleanup, parsing functions."""
-import collections
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
-import ConfigParser
+import collections
 import csv
-import io
 import json
+import logging
 import time
 
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import INSTALL_DIR
+from six import StringIO
+from six.moves import range
+import six.moves.configparser
 
 FIO_DIR = '%s/fio' % INSTALL_DIR
-GIT_REPO = 'http://git.kernel.dk/fio.git'
+GIT_REPO = 'https://github.com/axboe/fio.git'
 GIT_TAG = 'fio-2.17'
 FIO_PATH = FIO_DIR + '/fio'
 FIO_CMD_PREFIX = '%s --output-format=json' % FIO_PATH
@@ -95,8 +101,8 @@ def ParseJobFile(job_file):
     A dictionary of dictionaries of sample metadata, using test name as keys,
         dictionaries of sample metadata as value.
   """
-  config = ConfigParser.RawConfigParser(allow_no_value=True)
-  config.readfp(io.BytesIO(job_file))
+  config = six.moves.configparser.RawConfigParser(allow_no_value=True)
+  config.readfp(StringIO(job_file))
   global_metadata = {}
   if GLOBAL in config.sections():
     global_metadata = dict(config.items(GLOBAL))
@@ -104,8 +110,8 @@ def ParseJobFile(job_file):
   for section in config.sections():
     if section != GLOBAL:
       metadata = {}
-      metadata.update(dict(config.items(section)))
       metadata.update(global_metadata)
+      metadata.update(dict(config.items(section)))
       if JOB_STONEWALL_PARAMETER in metadata:
         del metadata[JOB_STONEWALL_PARAMETER]
       section_metadata[section] = metadata
@@ -144,7 +150,8 @@ def FioParametersToJob(fio_parameters):
 
 
 def ParseResults(job_file, fio_json_result, base_metadata=None,
-                 log_file_base='', bin_vals=None):
+                 log_file_base='', bin_vals=None,
+                 skip_latency_individual_stats=False):
   """Parse fio json output into samples.
 
   Args:
@@ -155,6 +162,8 @@ def ParseResults(job_file, fio_json_result, base_metadata=None,
     bin_vals: A 2-D list of int. Each list represents a list of
       bin values in histgram log. Calculated from remote VM using
       fio/tools/hist/fiologparser_hist.py
+    skip_latency_individual_stats: Bool. If true, skips pulling latency stats
+      that are not aggregate.
 
   Returns:
     A list of sample.Sample objects.
@@ -164,7 +173,7 @@ def ParseResults(job_file, fio_json_result, base_metadata=None,
   # come from the same fio run.
   timestamp = time.time()
   parameter_metadata = ParseJobFile(job_file)
-  io_modes = DATA_DIRECTION.values()
+  io_modes = list(DATA_DIRECTION.values())
 
   # clat_hist files are indexed sequentially by inner job.  If you have a job
   # file with 2 jobs, each with numjobs=4 you will have 8 clat_hist files.
@@ -208,28 +217,28 @@ def ParseResults(job_file, fio_json_result, base_metadata=None,
             return value
 
         percentiles = clat_section['percentile']
-        lat_statistics = [
-            ('min', _ConvertClat(clat_section['min'])),
-            ('max', _ConvertClat(clat_section['max'])),
-            ('mean', _ConvertClat(clat_section['mean'])),
-            ('stddev', _ConvertClat(clat_section['stddev'])),
-            ('p1', _ConvertClat(percentiles['1.000000'])),
-            ('p5', _ConvertClat(percentiles['5.000000'])),
-            ('p10', _ConvertClat(percentiles['10.000000'])),
-            ('p20', _ConvertClat(percentiles['20.000000'])),
-            ('p30', _ConvertClat(percentiles['30.000000'])),
-            ('p40', _ConvertClat(percentiles['40.000000'])),
-            ('p50', _ConvertClat(percentiles['50.000000'])),
-            ('p60', _ConvertClat(percentiles['60.000000'])),
-            ('p70', _ConvertClat(percentiles['70.000000'])),
-            ('p80', _ConvertClat(percentiles['80.000000'])),
-            ('p90', _ConvertClat(percentiles['90.000000'])),
-            ('p95', _ConvertClat(percentiles['95.000000'])),
-            ('p99', _ConvertClat(percentiles['99.000000'])),
-            ('p99.5', _ConvertClat(percentiles['99.500000'])),
-            ('p99.9', _ConvertClat(percentiles['99.900000'])),
-            ('p99.95', _ConvertClat(percentiles['99.950000'])),
-            ('p99.99', _ConvertClat(percentiles['99.990000']))]
+        lat_statistics = [('min', _ConvertClat(clat_section['min'])),
+                          ('max', _ConvertClat(clat_section['max'])),
+                          ('mean', _ConvertClat(clat_section['mean'])),
+                          ('stddev', _ConvertClat(clat_section['stddev']))]
+        if not skip_latency_individual_stats:
+          lat_statistics += [('p1', _ConvertClat(percentiles['1.000000'])),
+                             ('p5', _ConvertClat(percentiles['5.000000'])),
+                             ('p10', _ConvertClat(percentiles['10.000000'])),
+                             ('p20', _ConvertClat(percentiles['20.000000'])),
+                             ('p30', _ConvertClat(percentiles['30.000000'])),
+                             ('p40', _ConvertClat(percentiles['40.000000'])),
+                             ('p50', _ConvertClat(percentiles['50.000000'])),
+                             ('p60', _ConvertClat(percentiles['60.000000'])),
+                             ('p70', _ConvertClat(percentiles['70.000000'])),
+                             ('p80', _ConvertClat(percentiles['80.000000'])),
+                             ('p90', _ConvertClat(percentiles['90.000000'])),
+                             ('p95', _ConvertClat(percentiles['95.000000'])),
+                             ('p99', _ConvertClat(percentiles['99.000000'])),
+                             ('p99.5', _ConvertClat(percentiles['99.500000'])),
+                             ('p99.9', _ConvertClat(percentiles['99.900000'])),
+                             ('p99.95', _ConvertClat(percentiles['99.950000'])),
+                             ('p99.99', _ConvertClat(percentiles['99.990000']))]
 
         lat_metadata = parameters.copy()
         for name, val in lat_statistics:
@@ -250,7 +259,7 @@ def ParseResults(job_file, fio_json_result, base_metadata=None,
     if log_file_base and bin_vals:
       # Parse histograms
       aggregates = collections.defaultdict(collections.Counter)
-      for _ in xrange(int(job['job options']['numjobs'])):
+      for _ in range(int(parameters.get('numjobs', 1))):
         clat_hist_idx += 1
         hist_file_path = vm_util.PrependTempDir(
             '%s_clat_hist.%s.log' % (log_file_base, str(clat_hist_idx)))
@@ -273,8 +282,12 @@ def ComputeHistogramBinVals(vm, log_file):
   Returns:
     A list of float. Representing the mean value of the bin.
   """
-  return [float(v) for v in vm.RemoteCommand(
-      './%s %s' % (FIO_HIST_LOG_PARSER, log_file))[0].split()]
+  try:
+    return [float(v) for v in vm.RemoteCommand(
+        './%s %s' % (FIO_HIST_LOG_PARSER, log_file))[0].split()]
+  except errors.VirtualMachine.RemoteCommandError:
+    logging.exception('Calculate bin values for %s failed.', log_file)
+    return []
 
 
 def DeleteParameterFromJobFile(job_file, parameter):
@@ -305,6 +318,9 @@ def _ParseHistogram(hist_log_file, mean_bin_vals):
   Returns:
     A dict of the histograms, keyed by (data direction, block size).
   """
+  if not mean_bin_vals:
+    logging.warning('Skipping log file %s.', hist_log_file)
+    return {}
   aggregates = dict()
   with open(hist_log_file) as f:
     reader = csv.reader(f, delimiter=',')

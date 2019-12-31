@@ -34,7 +34,12 @@ RAGRS = 'Standard_RAGRS'
 
 STORAGE = 'Storage'
 BLOB_STORAGE = 'BlobStorage'
-VALID_TIERS = ['Basic', 'Standard']
+VALID_TIERS = ['Basic', 'Standard', 'Premium']
+
+# Azure redis cache tiers. See
+# https://docs.microsoft.com/en-us/azure/redis-cache/cache-faq for information.
+VALID_CACHE_SIZES = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6',
+                     'P1', 'P2', 'P3', 'P4', 'P5']
 
 flags.DEFINE_enum(
     'azure_storage_type', LRS,
@@ -62,9 +67,19 @@ flags.DEFINE_boolean('azure_accelerated_networking', False,
                      'create-vm-accelerated-networking-cli'
                      'for more information.')
 
-flags.DEFINE_enum('azure_tier', None, VALID_TIERS,
-                  'Performance tier to use for the machine type.')
+flags.DEFINE_enum('azure_tier', 'Basic', VALID_TIERS,
+                  'Performance tier to use for the machine type. Defaults to '
+                  'Basic.')
 
 flags.DEFINE_integer(
     'azure_compute_units', None,
     'Number of compute units to allocate for the machine type')
+
+flags.DEFINE_enum('azure_redis_size',
+                  'C3', VALID_CACHE_SIZES,
+                  'Azure redis cache size to use.')
+
+flags.DEFINE_boolean('azure_availability_set', True,
+                     'If True, create an availability set and place virtual '
+                     'machines in it. If False, do not create availability '
+                     'set.')

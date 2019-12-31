@@ -52,6 +52,10 @@ class Setup(object):
     """Error raised when the set of command line flags is invalid."""
     pass
 
+  class InvalidConfigurationError(Error):
+    """Error raised when configuration is invalid."""
+    pass
+
 
 class VirtualMachine(object):
   """Errors raised by virtual_machine.py."""
@@ -127,7 +131,7 @@ class VirtualMachine(object):
 
 
 class VmUtil(object):
-  """Errors raised by vm_utils.py."""
+  """Errors raised by vm_util.py."""
 
   class RestConnectionError(Error):
     pass
@@ -144,9 +148,18 @@ class VmUtil(object):
   class CalledProcessException(Error):
     pass
 
+  class IssueCommandError(Error):
+    pass
+
+  class IssueCommandTimeoutError(Error):
+    pass
+
 
 class Benchmarks(object):
   """Errors raised by individual benchmark."""
+
+  class BucketCreationError(Error):
+    pass
 
   class PrepareException(Error):
     pass
@@ -161,7 +174,17 @@ class Benchmarks(object):
     pass
 
   class QuotaFailure(Error):
-    pass
+    """Errors that are related to insufficient quota on cloud provider."""
+
+    class RateLimitExceededError(Error):
+      pass
+
+  class KnownIntermittentError(Error):
+    """Known intermittent failures of the benchmark.
+
+    These are non-retryable, known failure modes of the benchmark.  It is
+    recommended that the benchmark be completely re-run.
+    """
 
 
 class Resource(object):
@@ -178,6 +201,9 @@ class Resource(object):
     pass
 
   class RetryableGetError(Error):
+    pass
+
+  class SubclassNotFoundError(Error):
     pass
 
 

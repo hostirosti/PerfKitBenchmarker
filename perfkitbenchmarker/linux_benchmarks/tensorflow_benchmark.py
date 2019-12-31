@@ -22,14 +22,20 @@ between the workers. Each worker process runs the same model. When a worker
 needs a variable, it accesses it from the parameter server directly.
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import collections
+import posixpath
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import cuda_toolkit
+from perfkitbenchmarker.linux_packages import INSTALL_DIR
 from perfkitbenchmarker.linux_packages import tensorflow
+from six.moves import range
 
 FLAGS = flags.FLAGS
 
@@ -39,44 +45,55 @@ tensorflow:
   description: Runs Tensorflow Benchmark.
   vm_groups:
     default:
+      os_type: ubuntu1604
       vm_spec:
         GCP:
-          image: ubuntu-1604-xenial-v20180122
-          image_project: ubuntu-os-cloud
           machine_type: n1-standard-4
           zone: us-east1-d
           boot_disk_size: 200
         AWS:
-          image: ami-41e0b93b
           machine_type: p2.xlarge
           zone: us-east-1
           boot_disk_size: 200
         Azure:
-          image: Canonical:UbuntuServer:16.04.0-LTS:latest
           machine_type: Standard_NC6
           zone: eastus
 """
 
 GPU = 'gpu'
 CPU = 'cpu'
+NCHW = 'NCHW'
+NHWC = 'NHWC'
 PID_PREFIX = 'TF_PS_PID'
 MODELS = ['vgg11', 'vgg16', 'vgg19', 'lenet', 'googlenet', 'overfeat',
           'alexnet', 'trivial', 'inception3', 'inception4', 'resnet50',
           'resnet101', 'resnet152']
+FP16 = 'float16'
+FP32 = 'float32'
 
 flags.DEFINE_boolean('tf_forward_only', False, '''whether use forward-only or
                      training for benchmarking''')
-flags.DEFINE_list('tf_models', ['inception3', 'vgg16', 'alexnet', 'resnet50'],
-                  'name of the models to run')
+flags.DEFINE_list('tf_models', ['inception3', 'vgg16', 'alexnet', 'resnet50',
+                                'resnet152'], 'name of the models to run')
 flags.register_validator('tf_models',
                          lambda models: models and set(models).issubset(MODELS),
                          'Invalid models list. tf_models must be a subset of '
                          + ', '.join(MODELS))
+flags.DEFINE_string('tf_data_dir', None,
+                    'Path to dataset in TFRecord format (aka Example '
+                    'protobufs). If not specified, synthetic data will be '
+                    'used.')
+flags.DEFINE_string('tf_data_module', 'tensorflow/ILSVRC2012',
+                    'Data path in preprovisioned data bucket.')
+flags.DEFINE_integer('tf_num_files_train', 1024,
+                     'The number of files for training')
+flags.DEFINE_integer('tf_num_files_val', 128,
+                     'The number of files for validation')
 flags.DEFINE_enum('tf_data_name', 'imagenet', ['imagenet', 'flowers'],
                   'Name of dataset: imagenet or flowers.')
-flags.DEFINE_integer('tf_batch_size', None, 'batch size per compute device. '
-                     'If not provided, the suggested batch size is used for '
-                     'the given model')
+flags.DEFINE_list('tf_batch_sizes', None, 'batch sizes per compute device. '
+                  'If not provided, the suggested batch size is used for '
+                  'the given model')
 flags.DEFINE_enum('tf_variable_update', 'parameter_server',
                   ['parameter_server', 'replicated',
                    'distributed_replicated', 'independent'],
@@ -88,17 +105,35 @@ flags.DEFINE_enum('tf_local_parameter_device', CPU, [CPU, GPU],
                   variables happens.''')
 flags.DEFINE_enum('tf_device', GPU, [CPU, GPU],
                   'Device to use for computation: cpu or gpu')
-flags.DEFINE_enum('tf_data_format', 'NCHW', ['NCHW', 'NHWC'], '''Data layout to
+flags.DEFINE_enum('tf_data_format', NCHW, [NCHW, NHWC], '''Data layout to
                   use: NHWC (TF native) or NCHW (cuDNN native).''')
 flags.DEFINE_boolean('tf_distortions', True,
                      '''Enable/disable distortions during image preprocessing.
                      These include bbox and color distortions.''')
-flags.DEFINE_string('tf_benchmarks_commit_hash',
-                    'abe3c808933c85e6db1719cdb92fcbbd9eac6dec',
-                    'git commit hash of desired tensorflow benchmark commit.')
 flags.DEFINE_boolean('tf_distributed', False, 'Run TensorFlow distributed')
 flags.DEFINE_string('tf_distributed_port', '2222',
                     'The port to use in TensorFlow distributed job')
+flags.DEFINE_enum('tf_precision', FP32, [FP16, FP32],
+                  'Use 16-bit floats for certain tensors instead of 32-bit '
+                  'floats. This is currently experimental.')
+flags.DEFINE_boolean('tf_use_local_data', False, 'Whether to use data from '
+                     'local machine. If true, the benchmark will use data from '
+                     'cloud storage (GCS, S3, etc).')
+flags.DEFINE_string('tf_benchmark_args', None,
+                    'Arguments (as a string) to pass to tf_cnn_benchmarks. '
+                    'This can be used to run a benchmark with arbitrary '
+                    'parameters. Arguments will be parsed and added to the '
+                    'sample metadata. For example, '
+                    '--tf_benchmark_args="--nodistortions --optimizer=sgd '
+                    'will run tf_cnn_benchmarks.py '
+                    '--nodistortions --optimizer=sgd '
+                    'and put the following in the metadata: '
+                    '{\'nodistortions\': \'True\', \'optimizer\': \'sgd\'}. '
+                    'All arguments must be in the form --arg_name=value. '
+                    'If there are GPUs on the VM and no \'num_gpus\' flag in '
+                    'the tf_benchmarks_args flag, the num_gpus flag will '
+                    'automatically be populated with the number of available '
+                    'GPUs.')
 
 
 def LocalParameterDeviceValidator(value):
@@ -110,12 +145,50 @@ flags.register_validator('tf_local_parameter_device',
                          LocalParameterDeviceValidator)
 
 
+NVIDIA_TESLA_P4 = cuda_toolkit.NVIDIA_TESLA_P4
+NVIDIA_TESLA_K80 = cuda_toolkit.NVIDIA_TESLA_K80
+NVIDIA_TESLA_P100 = cuda_toolkit.NVIDIA_TESLA_P100
+NVIDIA_TESLA_V100 = cuda_toolkit.NVIDIA_TESLA_V100
+
 DEFAULT_BATCH_SIZE = 64
-DEFAULT_BATCH_SIZES_BY_MODEL = {
-    'vgg16': 32,
-    'alexnet': 512,
-    'resnet152': 32,
+DEFAULT_BATCH_SIZES = {
+    CPU: {
+        'alexnet': 512,
+        'inception3': 64,
+        'resnet50': 64,
+        'resnet152': 32,
+        'vgg16': 32,
+    },
+    NVIDIA_TESLA_K80: {
+        'alexnet': 512,
+        'inception3': 64,
+        'resnet50': 64,
+        'resnet152': 32,
+        'vgg16': 32,
+    },
+    NVIDIA_TESLA_P4: {
+        'alexnet': 512,
+        'inception3': 128,
+        'resnet50': 128,
+        'resnet152': 64,
+        'vgg16': 64,
+    },
+    NVIDIA_TESLA_P100: {
+        'alexnet': 512,
+        'inception3': 256,
+        'resnet50': 256,
+        'resnet152': 128,
+        'vgg16': 128,
+    },
+    NVIDIA_TESLA_V100: {
+        'alexnet': 512,
+        'inception3': 256,
+        'resnet50': 256,
+        'resnet152': 128,
+        'vgg16': 128,
+    },
 }
+DATA_DIR = posixpath.join(INSTALL_DIR, 'imagenet')
 
 
 class TFParseOutputException(Exception):
@@ -123,6 +196,10 @@ class TFParseOutputException(Exception):
 
 
 class TFParsePsPidException(Exception):
+  pass
+
+
+class TFDataDirException(Exception):
   pass
 
 
@@ -138,12 +215,40 @@ def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
-def _GetDefaultBatchSizeByModel(model):
-  return DEFAULT_BATCH_SIZES_BY_MODEL.get(model, DEFAULT_BATCH_SIZE)
+def _GetDefaultBatchSizeByModel(model, gpu_type):
+  """Return the default batch size for a given model and gpu / cpu type.
+
+  If gpu_type is none, it is assumed that the model will be running on the CPU.
+  If there is no default for the given model and gpu_type, a default batch
+  size will be returned as defined by DEFAULT_BATCH_SIZE.
+
+  Args:
+    model: name of the Tensorflow model
+    gpu_type: type of the GPU, or None
+
+  Returns:
+    default batch size for the given model / gpu_type,
+    or the default batch size.
+  """
+  computation_device = gpu_type or CPU
+  try:
+    return DEFAULT_BATCH_SIZES[computation_device][model]
+  except KeyError:
+    return DEFAULT_BATCH_SIZE
 
 
-def _GetBatchSize(model):
-  return FLAGS.tf_batch_size or _GetDefaultBatchSizeByModel(model)
+def _GetBatchSizes(model, gpu_type):
+  """Return the batch_size flag if specified, or the appropriate default if not.
+
+  Args:
+    model: name of the Tensorflow model
+    gpu_type: type of the GPU, or None
+
+  Returns:
+    value of the batch_size flag if specified, or the default batch size for the
+    given model / gpu_type.
+  """
+  return FLAGS.tf_batch_sizes or [_GetDefaultBatchSizeByModel(model, gpu_type)]
 
 
 def _UpdateBenchmarkSpecWithFlags(benchmark_spec):
@@ -154,34 +259,39 @@ def _UpdateBenchmarkSpecWithFlags(benchmark_spec):
   """
   benchmark_spec.forward_only = FLAGS.tf_forward_only
   benchmark_spec.data_name = FLAGS.tf_data_name
+  benchmark_spec.data_dir = (DATA_DIR if FLAGS.tf_use_local_data else
+                             FLAGS.tf_data_dir)
+  benchmark_spec.use_local_data = FLAGS.tf_use_local_data
   benchmark_spec.variable_update = FLAGS.tf_variable_update
-  benchmark_spec.local_parameter_device = FLAGS.tf_local_parameter_device
-  benchmark_spec.device = FLAGS.tf_device
-  benchmark_spec.data_format = FLAGS.tf_data_format
   benchmark_spec.distortions = FLAGS.tf_distortions
-  benchmark_spec.benchmarks_commit_hash = FLAGS.tf_benchmarks_commit_hash
-  benchmark_spec.tensorflow_pip_package = FLAGS.tf_pip_package
+  benchmark_spec.cnn_benchmarks_branch = FLAGS.tf_cnn_benchmarks_branch
+  benchmark_spec.tensorflow_cpu_pip_package = FLAGS.tf_cpu_pip_package
+  benchmark_spec.tensorflow_gpu_pip_package = FLAGS.tf_gpu_pip_package
   benchmark_spec.distributed = FLAGS.tf_distributed
+  benchmark_spec.precision = FLAGS.tf_precision
+  benchmark_spec.benchmark_args = FLAGS.tf_benchmark_args
 
 
 def _PrepareVm(vm):
   """Install and set up TensorFlow on the target vm.
 
   The TensorFlow benchmarks are also installed.
-  A specific commit of the benchmarks which works best with TensorFlow
-  1.3 is used and can be overridden with the flag tf_benchmarks_commit_hash.
+  A specific branch of the benchmarks cnn_tf_v1.10_compatible which works best
+  with TensorFlow 1.10 is used and can be overridden with the flag
+  tf_cnn_benchmarks_branch.
 
   Args:
     vm: virtual machine on which to install TensorFlow
   """
-  commit_hash = FLAGS.tf_benchmarks_commit_hash
+  if FLAGS.tf_data_dir and FLAGS.tf_use_local_data:
+    def _DownloadData(num_files, mode):
+      for i in range(num_files):
+        filename = '{}-{:05}-of-{:05}'.format(mode, i, num_files)
+        vm.DownloadPreprovisionedData(DATA_DIR, FLAGS.tf_data_module, filename)
+    _DownloadData(FLAGS.tf_num_files_train, 'train')
+    _DownloadData(FLAGS.tf_num_files_val, 'validation')
   vm.Install('tensorflow')
   vm.InstallPackages('git')
-  vm.RemoteCommand(
-      'git clone https://github.com/tensorflow/benchmarks.git', should_log=True)
-  vm.RemoteCommand(
-      'cd benchmarks && git checkout {}'.format(commit_hash)
-  )
 
 
 def Prepare(benchmark_spec):
@@ -195,37 +305,86 @@ def Prepare(benchmark_spec):
   vm_util.RunThreaded(_PrepareVm, vms)
   benchmark_spec.tensorflow_version = tensorflow.GetTensorFlowVersion(vms[0])
 
+  if cuda_toolkit.CheckNvidiaGpuExists(vms[0]):
+    benchmark_spec.gpu_type = cuda_toolkit.GetGpuType(vms[0])
 
-def _CreateMetadataDict(benchmark_spec, model, batch_size, num_gpus):
+
+def _GetMetadataFromBenchmarkArgs(tf_cnn_benchmark_args):
+  """Return a dictionary of arg names and values.
+
+  Only supports arguments in the following format:
+    --arg_name=arg_value
+
+  The above string will result in this function returning a dictionary
+  like so: {'arg_name': 'arg_value'}
+
+  Because this and other PKB benchmarks use the 'precision' flag to specify
+  fp16 or fp32, this function will convert the Tensorflow-specific precision
+  flag ('use_fp16') to 'precision' to keep results consistent. All other command
+  line arguments are extracted as is without being renamed.
+
+  Args:
+    tf_cnn_benchmark_args: string. The command line args to parse into a dict.
+
+  Returns:
+    A dictionary mapping argument names to their values.
+  """
+  args = tf_cnn_benchmark_args.split(' ')
+  args_dict = {arg.split('=')[0].replace('--', ''): arg.split('=')[1]
+               for arg in args}
+  if 'use_fp16' in args_dict:
+    if args_dict['use_fp16'].lower() == 'true':
+      args_dict['precision'] = FP16
+    else:
+      args_dict['precision'] = FP32
+  return args_dict
+
+
+def _CreateMetadataDict(benchmark_spec, model, batch_size):
   """Create metadata dict to be used in run results.
 
   Args:
     benchmark_spec: benchmark spec
     model: model which was run
     batch_size: batch sized used
-    num_gpus: number of GPUs used
 
   Returns:
     metadata dict
   """
   vm = benchmark_spec.vms[0]
-  metadata = dict()
-  if benchmark_spec.device == GPU:
+  metadata = {}
+  if cuda_toolkit.CheckNvidiaGpuExists(vm):
     metadata.update(cuda_toolkit.GetMetadata(vm))
-    metadata['num_gpus'] = num_gpus
+
+  metadata['command_line'] = benchmark_spec.tf_cnn_benchmark_cmd
+  metadata['cnn_benchmarks_branch'] = benchmark_spec.cnn_benchmarks_branch
+  metadata['tensorflow_version'] = benchmark_spec.tensorflow_version
+  metadata['tensorflow_cpu_pip_package'] = (
+      benchmark_spec.tensorflow_cpu_pip_package)
+  metadata['tensorflow_gpu_pip_package'] = (
+      benchmark_spec.tensorflow_gpu_pip_package)
+  # If we ran a custom command-line through the benchmark_args flag,
+  # add the metadata from that command and return. We don't need anymore
+  # metadata from this function as it is likely invalid.
+  if getattr(benchmark_spec, 'benchmark_args', None):
+    metadata.update(
+        _GetMetadataFromBenchmarkArgs(benchmark_spec.benchmark_args))
+    return metadata
+
   metadata['model'] = model
   metadata['batch_size'] = batch_size
   metadata['forward_only'] = benchmark_spec.forward_only
   metadata['data_name'] = benchmark_spec.data_name
+  metadata['data_dir'] = benchmark_spec.data_dir
+  metadata['use_local_data'] = benchmark_spec.use_local_data
   metadata['variable_update'] = benchmark_spec.variable_update
   metadata['local_parameter_device'] = benchmark_spec.local_parameter_device
   metadata['device'] = benchmark_spec.device
   metadata['data_format'] = benchmark_spec.data_format
   metadata['distortions'] = benchmark_spec.distortions
-  metadata['benchmarks_commit_hash'] = benchmark_spec.benchmarks_commit_hash
-  metadata['tensorflow_version'] = benchmark_spec.tensorflow_version
-  metadata['tensorflow_pip_package'] = benchmark_spec.tensorflow_pip_package
   metadata['distributed'] = benchmark_spec.distributed
+  metadata['precision'] = benchmark_spec.precision
+  metadata['num_gpus'] = benchmark_spec.num_gpus
   return metadata
 
 
@@ -266,7 +425,7 @@ def _ExtractTfParameterServerPid(output):
                                 'command output.')
 
 
-def _MakeSamplesFromOutput(benchmark_spec, output, model, batch_size, num_gpus):
+def _MakeSamplesFromOutput(benchmark_spec, output, model, batch_size):
   """Create a sample containing the measured TensorFlow throughput.
 
   Args:
@@ -274,73 +433,115 @@ def _MakeSamplesFromOutput(benchmark_spec, output, model, batch_size, num_gpus):
     output: TensorFlow output
     model: model which was run
     batch_size: batch sized used
-    num_gpus: number of GPUs used
 
   Returns:
     a Sample containing the TensorFlow throughput in Gflops
   """
-  metadata = _CreateMetadataDict(benchmark_spec, model, batch_size, num_gpus)
+  metadata = _CreateMetadataDict(benchmark_spec, model, batch_size)
   tensorflow_throughput = _ExtractThroughput(output)
   return sample.Sample('Training synthetic data', tensorflow_throughput,
                        'images/sec', metadata)
 
 
-def _RunModelOnVm(vm, model, benchmark_spec, args='', job_name=''):
-  """Runs a TensorFlow benchmark on a single VM.
+def _GetTfCnnBenchmarkCommand(vm, model, batch_size, benchmark_spec,
+                              args='', job_name=''):
+  """Create the command used to run the tf_cnn_benchmarks script.
+
+  The command is either formulated using flag values stored on the
+  benchmark_spec, or is essentially provided outright through the
+  benchmark_args flag.
 
   Args:
-    vm: VM to run on
-    model: string, the name of model to run
-    benchmark_spec: BenchmarkSpec object
+    vm: the VM to run on.
+    model: name of the model to run.
+    batch_size: batch size to use for training.
+    benchmark_spec: the benchmark spec object.
     args: string, distributed arguments
     job_name: string, distributed job name
 
   Returns:
-    a Sample containing the TensorFlow throughput or the process identification
-    number from TensorFlow parameter server.
+    A string that runs the tf_cnn_benchmarks.py script
+    with the desired arguments.
   """
-  tf_cnn_benchmark_dir = 'benchmarks/scripts/tf_cnn_benchmarks'
-  batch_size = _GetBatchSize(model)
-  tf_cnn_benchmark_cmd = (
-      'python tf_cnn_benchmarks.py '
+  num_gpus = (cuda_toolkit.QueryNumberOfGpus(vm) if
+              cuda_toolkit.CheckNvidiaGpuExists(vm) else 0)
+  benchmark_spec.num_gpus = num_gpus
+
+  if benchmark_spec.benchmark_args is not None:
+    cmd = 'python tf_cnn_benchmarks.py ' + benchmark_spec.benchmark_args
+    # If the user didn't specify num_gpus in the benchmark_args string,
+    # use all the GPUs on the system.
+    if '--num_gpus' not in benchmark_spec.benchmark_args and num_gpus:
+      cmd = '{cmd} --num_gpus={num_gpus}'.format(cmd=cmd, num_gpus=num_gpus)
+    return cmd
+
+  benchmark_spec.local_parameter_device = FLAGS.tf_local_parameter_device
+  benchmark_spec.device = FLAGS.tf_device
+  benchmark_spec.data_format = FLAGS.tf_data_format
+  if num_gpus == 0:
+    benchmark_spec.local_parameter_device = CPU
+    benchmark_spec.device = CPU
+    benchmark_spec.data_format = NHWC
+
+  cmd = (
+      '{env_vars} python tf_cnn_benchmarks.py '
       '--local_parameter_device={local_parameter_device} '
       '--batch_size={batch_size} '
       '--model={model} '
+      '{data} '
       '--data_name={data_name} '
       '--variable_update={variable_update} '
       '--distortions={distortions} '
       '--device={device} '
       '--data_format={data_format} '
       '--forward_only={forward_only} '
-      '--flush_stdout=true'.format(
+      '--use_fp16={use_fp16} '
+      '{num_gpus} '
+      '{job_name}'.format(
+          env_vars=tensorflow.GetEnvironmentVars(vm),
           local_parameter_device=benchmark_spec.local_parameter_device,
           batch_size=batch_size,
           model=model,
+          data=('--data_dir={}'.format(benchmark_spec.data_dir) if
+                benchmark_spec.data_dir else ''),
           data_name=benchmark_spec.data_name,
           variable_update=benchmark_spec.variable_update,
           distortions=benchmark_spec.distortions,
           device=benchmark_spec.device,
           data_format=benchmark_spec.data_format,
-          forward_only=benchmark_spec.forward_only))
-  if benchmark_spec.device == GPU:
-    num_gpus = cuda_toolkit.QueryNumberOfGpus(vm)
-    tf_cnn_benchmark_cmd = '{env} {cmd} --num_gpus={gpus}'.format(
-        env=tensorflow.GetEnvironmentVars(vm),
-        cmd=tf_cnn_benchmark_cmd,
-        gpus=num_gpus)
-  else:
-    num_gpus = 0
-  if args:
-    tf_cnn_benchmark_cmd = '{cmd} --job_name={job} {args}'.format(
-        cmd=tf_cnn_benchmark_cmd, job=job_name, args=args)
+          forward_only=benchmark_spec.forward_only,
+          use_fp16=(benchmark_spec.precision == FP16),
+          num_gpus='--num_gpus={}'.format(num_gpus) if num_gpus else '',
+          job_name='--job_name={0} {1}'.format(job_name, args) if args else ''))
+  return cmd
+
+
+def _RunModelOnVm(vm, model, batch_size, benchmark_spec, args='', job_name=''):
+  """Runs a TensorFlow benchmark on a single VM.
+
+  Args:
+    vm: VM to run on
+    model: string, the name of model to run
+    batch_size: int, training batch size
+    benchmark_spec: BenchmarkSpec object
+    args: string, distributed arguments
+    job_name: string, distributed job name
+
+  Returns:
+    a Sample containing the TensorFlow throughput or the process
+    identification number from TensorFlow parameter server.
+  """
+  tf_cnn_benchmark_cmd = _GetTfCnnBenchmarkCommand(
+      vm, model, batch_size, benchmark_spec, args, job_name)
+  benchmark_spec.tf_cnn_benchmark_cmd = tf_cnn_benchmark_cmd
+  tf_cnn_benchmark_dir = 'benchmarks/scripts/tf_cnn_benchmarks'
   run_command = 'cd {path} ; {cmd}'.format(path=tf_cnn_benchmark_dir,
                                            cmd=tf_cnn_benchmark_cmd)
   output, _ = vm.RobustRemoteCommand(run_command, should_log=True)
   if job_name == 'ps':
     return _ExtractTfParameterServerPid(output)
   else:
-    return _MakeSamplesFromOutput(benchmark_spec, output, model, batch_size,
-                                  num_gpus)
+    return _MakeSamplesFromOutput(benchmark_spec, output, model, batch_size)
 
 
 def _RunOnVm(vm, benchmark_spec):
@@ -353,7 +554,15 @@ def _RunOnVm(vm, benchmark_spec):
   Returns:
     A list of samples containing the TensorFlow throughput from different models
   """
-  return [_RunModelOnVm(vm, model, benchmark_spec) for model in FLAGS.tf_models]
+  samples = []
+  if FLAGS.tf_benchmark_args:
+    return [_RunModelOnVm(vm, None, None, benchmark_spec)]
+
+  gpu_type = getattr(benchmark_spec, 'gpu_type', None)
+  for model in FLAGS.tf_models:
+    for batch_size in _GetBatchSizes(model, gpu_type):
+      samples.append(_RunModelOnVm(vm, model, batch_size, benchmark_spec))
+  return samples
 
 
 def _GetHostsArgs(hosts):
@@ -379,26 +588,29 @@ def _RunDistributedTf(benchmark_spec):
       ps_args=_GetHostsArgs(ps_hosts), worker_args=_GetHostsArgs(worker_hosts))
   flattened_results = []
   vm_pid = collections.namedtuple('vm_pid', 'vm pid')
+  gpu_type = getattr(benchmark_spec, 'gpu_type', None)
   for model in FLAGS.tf_models:
-    ps_pids = []
-    for task_index, vm in enumerate(ps_hosts):
-      dist_ps_args = ('{args} --task_index={index} &\n'
-                      'echo {pid} $!').format(args=dist_args,
-                                              index=task_index,
-                                              pid=PID_PREFIX)
-      pid = _RunModelOnVm(vm, model, benchmark_spec, dist_ps_args, 'ps')
-      ps_pids.append(vm_pid(vm=vm, pid=pid))
-    args = []
-    for task_index, vm in enumerate(worker_hosts):
-      dist_worker_args = ('{args} --job_name=worker '
-                          '--task_index={index}').format(args=dist_args,
-                                                         index=task_index)
-      args.append(((vm, model, benchmark_spec, dist_worker_args, 'worker'),
-                   {}))
-    result = vm_util.RunThreaded(_RunModelOnVm, args)
-    for ps_pid in ps_pids:
-      ps_pid.vm.RemoteCommand('kill -9 %s' % ps_pid.pid)
-    flattened_results.extend(vm_result for vm_result in result)
+    for batch_size in _GetBatchSizes(model, gpu_type):
+      ps_pids = []
+      for task_index, vm in enumerate(ps_hosts):
+        dist_ps_args = ('{args} --task_index={index} &\n'
+                        'echo {pid} $!').format(args=dist_args,
+                                                index=task_index,
+                                                pid=PID_PREFIX)
+        pid = _RunModelOnVm(vm, model, batch_size, benchmark_spec, dist_ps_args,
+                            'ps')
+        ps_pids.append(vm_pid(vm=vm, pid=pid))
+      args = []
+      for task_index, vm in enumerate(worker_hosts):
+        dist_worker_args = ('{args} --job_name=worker '
+                            '--task_index={index}').format(args=dist_args,
+                                                           index=task_index)
+        args.append(((vm, model, batch_size, benchmark_spec, dist_worker_args,
+                      'worker'), {}))
+      result = vm_util.RunThreaded(_RunModelOnVm, args)
+      for ps_pid in ps_pids:
+        ps_pid.vm.RemoteCommand('kill -9 %s' % ps_pid.pid)
+      flattened_results.extend(vm_result for vm_result in result)
   return flattened_results
 
 

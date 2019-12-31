@@ -18,21 +18,19 @@ Spark clusters can be created and deleted.
 
 import json
 import logging
-
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import spark_service
 from perfkitbenchmarker import vm_util
-
-import aws_network
-import util
+from perfkitbenchmarker.providers.aws import aws_network
+from perfkitbenchmarker.providers.aws import util
 
 
 FLAGS = flags.FLAGS
 
 DEFAULT_MACHINE_TYPE = 'm3.xlarge'
-RELEASE_LABEL = 'emr-4.5.0'
+RELEASE_LABEL = 'emr-5.23.0'
 READY_CHECK_SLEEP = 30
 READY_CHECK_TRIES = 60
 READY_STATE = 'WAITING'
@@ -45,7 +43,7 @@ MANAGER_SG = 'EmrManagedMasterSecurityGroup'
 WORKER_SG = 'EmrManagedSlaveSecurityGroup'
 
 # Certain machine types require a subnet.
-NEEDS_SUBNET = ['m4', 'c4']
+NEEDS_SUBNET = ['m4', 'c4', 'm5', 'c5']
 
 
 class AwsSecurityGroup(resource.BaseResource):
@@ -68,12 +66,12 @@ class AwsSecurityGroup(resource.BaseResource):
   def _Delete(self):
     cmd = self.cmd_prefix + ['ec2', 'delete-security-group',
                              '--group-id=' + self.group_id]
-    vm_util.IssueCommand(cmd)
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
 
   def _Exists(self):
     cmd = self.cmd_prefix + ['ec2', 'describe-security-groups',
                              '--group-id=' + self.group_id]
-    _, _, retcode = vm_util.IssueCommand(cmd)
+    _, _, retcode = vm_util.IssueCommand(cmd, raise_on_failure=False)
     # if the security group doesn't exist, the describe command gives an error.
     return retcode == 0
 
@@ -103,7 +101,7 @@ class AwsEMR(spark_service.BaseSparkService):
     # TODO(hildrum) use availability zone when appropriate
     worker_machine_type = self.spec.worker_group.vm_spec.machine_type
     leader_machine_type = self.spec.master_group.vm_spec.machine_type
-    self.cmd_prefix = util.AWS_PREFIX
+    self.cmd_prefix = list(util.AWS_PREFIX)
 
     if self.zone:
       region = util.GetRegionFromZone(self.zone)
@@ -123,8 +121,8 @@ class AwsEMR(spark_service.BaseSparkService):
   def _CreateLogBucket(self):
     bucket_name = 's3://pkb-{0}-emr'.format(FLAGS.run_uri)
     cmd = self.cmd_prefix + ['s3', 'mb', bucket_name]
-    _, _, rc = vm_util.IssueCommand(cmd)
-    if rc != 0:
+    _, _, retcode = vm_util.IssueCommand(cmd, raise_on_failure=False)
+    if retcode != 0:
       raise Exception('Error creating logs bucket')
     self.bucket_to_delete = bucket_name
     return bucket_name
@@ -172,6 +170,16 @@ class AwsEMR(spark_service.BaseSparkService):
     result = json.loads(stdout)
     self.cluster_id = result['ClusterId']
     logging.info('Cluster created with id %s', self.cluster_id)
+    for tag_key, tag_value in util.MakeDefaultTags().items():
+      self._AddTag(tag_key, tag_value)
+
+  def _AddTag(self, key, value):
+    """Add the key value pair as a tag to the emr cluster."""
+    cmd = self.cmd_prefix + ['emr', 'add-tags',
+                             '--resource-id', self.cluster_id,
+                             '--tag',
+                             '{}={}'.format(key, value)]
+    vm_util.IssueCommand(cmd)
 
   def _DeleteSecurityGroups(self):
     """Delete the security groups associated with this cluster."""
@@ -208,7 +216,7 @@ class AwsEMR(spark_service.BaseSparkService):
 
     cmd = self.cmd_prefix + ['emr', 'terminate-clusters', '--cluster-ids',
                              self.cluster_id]
-    vm_util.IssueCommand(cmd)
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
 
   def _DeleteDependencies(self):
     if self.network:
@@ -222,8 +230,8 @@ class AwsEMR(spark_service.BaseSparkService):
     """Check to see whether the cluster exists."""
     cmd = self.cmd_prefix + ['emr', 'describe-cluster',
                              '--cluster-id', self.cluster_id]
-    stdout, _, rc = vm_util.IssueCommand(cmd)
-    if rc != 0:
+    stdout, _, retcode = vm_util.IssueCommand(cmd, raise_on_failure=False)
+    if retcode != 0:
       return False
     result = json.loads(stdout)
     if result['Cluster']['Status']['State'] in DELETED_STATES:
@@ -267,8 +275,8 @@ class AwsEMR(spark_service.BaseSparkService):
   def _CheckForFile(self, filename):
     """Wait for file to appear on s3."""
     cmd = self.cmd_prefix + ['s3', 'ls', filename]
-    _, _, rc = vm_util.IssueCommand(cmd)
-    return rc == 0
+    _, _, retcode = vm_util.IssueCommand(cmd, raise_on_failure=False)
+    return retcode == 0
 
   def _IsStepDone(self, step_id):
     """Determine whether the step is done.
@@ -380,11 +388,17 @@ class AwsEMR(spark_service.BaseSparkService):
       WaitForFile(s3_stdout)
       dest_file = '{0}.gz'.format(job_stdout_file)
       cp_cmd = ['aws', 's3', 'cp', s3_stdout, dest_file]
-      _, _, rc = vm_util.IssueCommand(cp_cmd)
-      if rc == 0:
+      _, _, retcode = vm_util.IssueCommand(cp_cmd, raise_on_failure=False)
+      if retcode == 0:
         uncompress_cmd = ['gunzip', '-f', dest_file]
         vm_util.IssueCommand(uncompress_cmd)
     return metrics
 
   def SetClusterProperty(self):
     pass
+
+  def ExecuteOnMaster(self, script_path, script_args):
+    raise NotImplementedError()
+
+  def CopyFromMaster(self, remote_path, local_path):
+    raise NotImplementedError()

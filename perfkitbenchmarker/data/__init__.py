@@ -22,17 +22,18 @@ Users can specify additional paths to search for required data files using the
 `--data_search_paths` flag.
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import abc
 import logging
 import os
 import shutil
-
-import pkg_resources
-
 import perfkitbenchmarker
-
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import temp_dir
+import pkg_resources
+import six
 
 FLAGS = flags.FLAGS
 
@@ -49,10 +50,8 @@ class ResourceNotFound(ValueError):
   pass
 
 
-class ResourceLoader(object):
+class ResourceLoader(six.with_metaclass(abc.ABCMeta, object)):
   """An interface for loading named resources."""
-
-  __metaclass__ = abc.ABCMeta
 
   @abc.abstractmethod
   def ResourceExists(self, name):
@@ -215,3 +214,26 @@ def ResourcePath(resource_name, search_user_paths=True):
 
   raise ResourceNotFound(
       '{0} (Searched: {1})'.format(resource_name, loaders))
+
+
+def ResourceExists(resource_name, search_user_paths=True):
+  """Returns True if a resource exists.
+
+  Loaders are searched in order until the resource is found.
+  If no loader provides 'resource_name', returns False.
+
+  If 'search_user_paths' is true, the directories specified by
+  "--data_search_paths" are consulted before the default paths.
+
+  Args:
+    resource_name: string. Name of a resource.
+    search_user_paths: boolean. Whether paths from "--data_search_paths" should
+      be searched before the default paths.
+  Returns:
+    Whether the resource exists.
+  """
+  try:
+    ResourcePath(resource_name, search_user_paths)
+    return True
+  except ResourceNotFound:
+    return False

@@ -20,9 +20,11 @@ Use 'gcloud compute disk-types list' to determine valid disk types.
 import json
 
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
-from perfkitbenchmarker.providers.gcp import util
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers import GCP
+from perfkitbenchmarker.providers.gcp import util
 
 FLAGS = flags.FLAGS
 
@@ -46,8 +48,8 @@ DISK_METADATA = {
     }
 }
 
-SCSI = "SCSI"
-NVME = "NVME"
+SCSI = 'SCSI'
+NVME = 'NVME'
 
 disk.RegisterDiskTypeMap(GCP, DISK_TYPE)
 
@@ -73,27 +75,30 @@ class GceDisk(disk.BaseDisk):
     cmd = util.GcloudCommand(self, 'compute', 'disks', 'create', self.name)
     cmd.flags['size'] = self.disk_size
     cmd.flags['type'] = self.disk_type
+    cmd.flags['labels'] = util.MakeFormattedDefaultTags()
     if self.image:
       cmd.flags['image'] = self.image
     if self.image_project:
       cmd.flags['image-project'] = self.image_project
-    cmd.Issue()
+    _, stderr, retcode = cmd.Issue(raise_on_failure=False)
+    util.CheckGcloudResponseKnownFailures(stderr, retcode)
 
   def _Delete(self):
     """Deletes the disk."""
     cmd = util.GcloudCommand(self, 'compute', 'disks', 'delete', self.name)
-    cmd.Issue()
+    cmd.Issue(raise_on_failure=False)
 
   def _Exists(self):
     """Returns true if the disk exists."""
     cmd = util.GcloudCommand(self, 'compute', 'disks', 'describe', self.name)
-    stdout, _, _ = cmd.Issue(suppress_warning=True)
+    stdout, _, _ = cmd.Issue(suppress_warning=True, raise_on_failure=False)
     try:
       json.loads(stdout)
     except ValueError:
       return False
     return True
 
+  @vm_util.Retry()
   def Attach(self, vm):
     """Attaches the disk to a VM.
 
@@ -105,7 +110,17 @@ class GceDisk(disk.BaseDisk):
                              self.attached_vm_name)
     cmd.flags['device-name'] = self.name
     cmd.flags['disk'] = self.name
-    cmd.IssueRetryable()
+    stdout, stderr, retcode = cmd.Issue(raise_on_failure=False)
+    # Gcloud attach-disk commands may still attach disks despite being rate
+    # limited.
+    if retcode:
+      if (cmd.rate_limited and 'is already being used' in stderr and
+          FLAGS.gcp_retry_on_rate_limited):
+        return
+      debug_text = ('Ran: {%s}\nReturnCode:%s\nSTDOUT: %s\nSTDERR: %s' %
+                    (' '.join(cmd.GetCommand()), retcode, stdout, stderr))
+      raise errors.VmUtil.CalledProcessException(
+          'Command returned a non-zero exit code:\n{}'.format(debug_text))
 
   def Detach(self):
     """Detaches the disk from a VM."""
@@ -117,7 +132,8 @@ class GceDisk(disk.BaseDisk):
 
   def GetDevicePath(self):
     """Returns the path to the device inside the VM."""
-    if FLAGS.gce_ssd_interface == SCSI:
-      return '/dev/disk/by-id/google-%s' % self.name
-    elif FLAGS.gce_ssd_interface == NVME:
+    if self.disk_type == disk.LOCAL and FLAGS.gce_ssd_interface == NVME:
       return '/dev/%s' % self.name
+    else:
+      # by default, gce_ssd_interface == SCSI and returns this name id
+      return '/dev/disk/by-id/google-%s' % self.name

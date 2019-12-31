@@ -15,6 +15,9 @@
       (https://developer.nvidia.com/cuda-code-samples)
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import numpy
 import re
 from perfkitbenchmarker import configs
@@ -23,6 +26,7 @@ from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker.linux_packages import cuda_toolkit
+from six.moves import range
 
 DEFAULT_RANGE_START = 1 << 26  # 64 MB
 DEFAULT_RANGE_STEP = 1 << 26  # 64 MB
@@ -47,7 +51,8 @@ flag_util.DEFINE_integerlist(
     flag_util.IntegerList(
         [DEFAULT_RANGE_START, DEFAULT_RANGE_END,
          DEFAULT_RANGE_STEP]), 'range of transfer sizes to use in bytes. '
-    'Only used if gpu_pcie_bandwidth_mode is set to range')
+    'Only used if gpu_pcie_bandwidth_mode is set to range',
+    module_name=__name__)
 
 FLAGS = flags.FLAGS
 
@@ -59,20 +64,16 @@ gpu_pcie_bandwidth:
     default:
       vm_spec:
         GCP:
-          image: ubuntu-1604-xenial-v20161115
-          image_project: ubuntu-os-cloud
           machine_type: n1-standard-4
           gpu_type: k80
           gpu_count: 1
           zone: us-east1-d
           boot_disk_size: 200
         AWS:
-          image: ami-d15a75c7
           machine_type: p2.xlarge
           zone: us-east-1
           boot_disk_size: 200
         Azure:
-          image: Canonical:UbuntuServer:16.04.0-LTS:latest
           machine_type: Standard_NC6
           zone: eastus
 """
@@ -284,7 +285,7 @@ def Run(benchmark_spec):
     metadata['range_step'] = transfer_size_range[2]
 
   run_command = ('%s/extras/demo_suite/bandwidthTest --device=all' %
-                 cuda_toolkit.CUDA_TOOLKIT_INSTALL_DIR)
+                 metadata['cuda_toolkit_installation_dir'])
   if mode == 'range':
     run_command += (' --mode=range --start={0} --end={1} --increment={2}'
                     .format(transfer_size_range[0], transfer_size_range[1],

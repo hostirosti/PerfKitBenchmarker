@@ -37,6 +37,10 @@ average latency target is 40ms. The root node will vary the fanout from 1 to 4
 and measure the scaling efficiency.
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import logging
 import re
 import time
@@ -47,6 +51,7 @@ from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 
 from perfkitbenchmarker.linux_packages import oldisim_dependencies
+from six.moves import map
 
 FLAGS = flags.FLAGS
 
@@ -111,7 +116,7 @@ def Prepare(benchmark_spec):
   # Launch job on the leaf nodes.
   leaf_server_bin = oldisim_dependencies.BinaryPath('LeafNode')
   for vm in leaf_vms:
-    leaf_cmd = '%s --threads=%s' % (leaf_server_bin, vm.num_cpus)
+    leaf_cmd = '%s --threads=%s' % (leaf_server_bin, vm.NumCpusForBenchmark())
     vm.RemoteCommand('%s &> /dev/null &' % leaf_cmd)
 
 
@@ -125,8 +130,8 @@ def SetupRoot(root_vm, leaf_vms):
   fanout_args = ' '.join(['--leaf=%s' % i.internal_ip
                           for i in leaf_vms])
   root_server_bin = oldisim_dependencies.BinaryPath('ParentNode')
-  root_cmd = '%s --threads=%s %s' % (root_server_bin, root_vm.num_cpus,
-                                     fanout_args)
+  root_cmd = '%s --threads=%s %s' % (root_server_bin,
+                                     root_vm.NumCpusForBenchmark(), fanout_args)
   logging.info('Root cmdline: %s', root_cmd)
   root_vm.RemoteCommand('%s &> /dev/null &' % root_cmd)
 
@@ -202,7 +207,7 @@ def RunLoadTest(benchmark_spec, fanout):
   time.sleep(5)
   driver_cmd = '%s -s %s:%s -t 30 -- %s %s --threads=%s --depth=16' % (
       launch_script, FLAGS.oldisim_latency_metric, FLAGS.oldisim_latency_target,
-      driver_binary, driver_args, driver_vm.num_cpus)
+      driver_binary, driver_args, driver_vm.NumCpusForBenchmark())
   logging.info('Driver cmdline: %s', driver_cmd)
   stdout, _ = driver_vm.RemoteCommand(driver_cmd, should_log=True)
   return ParseOutput(stdout)
@@ -220,15 +225,12 @@ def Run(benchmark_spec):
   """
   results = []
   qps_dict = dict()
-  vms = benchmark_spec.vms
-  vm = vms[0]
 
   fanout_list = set([1, FLAGS.oldisim_num_leaves])
   for fanout in map(int, FLAGS.oldisim_fanout):
     if fanout > 1 and fanout < FLAGS.oldisim_num_leaves:
       fanout_list.add(fanout)
 
-  metadata = {'num_cpus': vm.num_cpus}
   for fanout in sorted(fanout_list):
     qps = RunLoadTest(benchmark_spec, fanout)[2]
     qps_dict[fanout] = qps
@@ -236,6 +238,7 @@ def Run(benchmark_spec):
       base_qps = qps
     name = 'Scaling efficiency of %s leaves' % fanout
     scaling_efficiency = round(min(qps_dict[fanout] / base_qps, 1), 2)
+    metadata = {}
     results.append(sample.Sample(name, scaling_efficiency, '', metadata))
 
   return results

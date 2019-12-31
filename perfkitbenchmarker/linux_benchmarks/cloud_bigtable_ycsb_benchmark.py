@@ -23,6 +23,7 @@ Compared to hbase_ycsb, this benchmark:
   * Adds netty-tcnative-boringssl, used for communication with Bigtable.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -33,17 +34,26 @@ import subprocess
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import data
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.linux_benchmarks import hbase_ycsb_benchmark \
-    as hbase_ycsb
+from perfkitbenchmarker.linux_benchmarks import hbase_ycsb_benchmark as hbase_ycsb
 from perfkitbenchmarker.linux_packages import hbase
 from perfkitbenchmarker.linux_packages import ycsb
 from perfkitbenchmarker.providers.gcp import gcp_bigtable
 
 FLAGS = flags.FLAGS
 
-HBASE_CLIENT_VERSION = '1.1'
-BIGTABLE_CLIENT_VERSION = '0.9.0'
+HBASE_CLIENT_VERSION = '1.x'
+BIGTABLE_CLIENT_VERSION = '1.4.0'
+
+# TODO(user): remove the custom ycsb build once the head version of YCSB
+# is updated to share Bigtable table object, and PKB is updated to work with the
+# new YCSB version (as of now, YCSB 0.17.0 does not work for PKB due to package
+# move from com.yahoo.ycsb to site.ycsb). The source code of the patched YCSB
+# 0.14.0 can be found at 'https://storage.googleapis.com/cbt_ycsb_client_jar/'
+# 'YCSB-0.14.0-Bigtable-table-object-sharing.zip'.
+YCSB_BIGTABLE_TABLE_SHARING_TAR_URL = (
+    'https://storage.googleapis.com/cbt_ycsb_client_jar/ycsb-0.14.0.tar.gz')
 
 flags.DEFINE_string('google_bigtable_endpoint', 'bigtable.googleapis.com',
                     'Google API endpoint for Cloud Bigtable.')
@@ -51,18 +61,31 @@ flags.DEFINE_string('google_bigtable_admin_endpoint',
                     'bigtableadmin.googleapis.com',
                     'Google API endpoint for Cloud Bigtable table '
                     'administration.')
-flags.DEFINE_string('google_bigtable_zone_name', 'us-central1-b',
-                    'Bigtable zone.')
 flags.DEFINE_string('google_bigtable_instance_name', None,
-                    'Bigtable instance name.')
+                    'Bigtable instance name. If not specified, new instance '
+                    'will be created and deleted on the fly.')
+flags.DEFINE_string('google_bigtable_static_table_name', None,
+                    'Bigtable table name. If not specified, a temporary table '
+                    'will be created and deleted on the fly.')
+flags.DEFINE_boolean('google_bigtable_enable_table_object_sharing', False,
+                     'If true, will use a YCSB binary that shares the same '
+                     'Bigtable table object across all the threads on a VM.')
 flags.DEFINE_string(
     'google_bigtable_hbase_jar_url',
     'https://oss.sonatype.org/service/local/repositories/releases/content/'
-    'com/google/cloud/bigtable/bigtable-hbase-{0}/'
-    '{1}/bigtable-hbase-{0}-{1}.jar'.format(
+    'com/google/cloud/bigtable/bigtable-hbase-{0}-hadoop/'
+    '{1}/bigtable-hbase-{0}-hadoop-{1}.jar'.format(
         HBASE_CLIENT_VERSION,
         BIGTABLE_CLIENT_VERSION),
     'URL for the Bigtable-HBase client JAR.')
+flags.DEFINE_boolean('get_bigtable_cluster_cpu_utilization', False,
+                     'If true, will gather bigtable cluster cpu utilization '
+                     'for the duration of performance test run stage, and add '
+                     'a sample for the data. To enable this '
+                     'functionality, need to set environment variable '
+                     'GOOGLE_APPLICATION_CREDENTIALS as described in '
+                     'https://cloud.google.com/docs/authentication/'
+                     'getting-started.')
 
 BENCHMARK_NAME = 'cloud_bigtable_ycsb'
 BENCHMARK_CONFIG = """
@@ -79,11 +102,18 @@ cloud_bigtable_ycsb:
       https://www.googleapis.com/auth/bigtable.admin
       https://www.googleapis.com/auth/bigtable.data"""
 
-TCNATIVE_BORINGSSL_URL = (
-    'http://search.maven.org/remotecontent?filepath='
-    'io/netty/netty-tcnative-boringssl-static/'
-    '1.1.33.Fork13/'
+# Starting from version 1.4.0, there is no need to install a separate boring ssl
+# via TCNATIVE_BORINGSSL_URL.
+TCNATIVE_BORINGSSL_JAR = (
     'netty-tcnative-boringssl-static-1.1.33.Fork13-linux-x86_64.jar')
+TCNATIVE_BORINGSSL_URL = posixpath.join(
+    'https://search.maven.org/remotecontent?filepath='
+    'io/netty/netty-tcnative-boringssl-static/'
+    '1.1.33.Fork13/', TCNATIVE_BORINGSSL_JAR)
+METRICS_CORE_JAR = 'metrics-core-3.1.2.jar'
+DROPWIZARD_METRICS_CORE_URL = posixpath.join(
+    'https://search.maven.org/remotecontent?filepath='
+    'io/dropwizard/metrics/metrics-core/3.1.2/', METRICS_CORE_JAR)
 HBASE_SITE = 'cloudbigtable/hbase-site.xml.j2'
 HBASE_CONF_FILES = [HBASE_SITE]
 HBASE_BINDING = 'hbase10-binding'
@@ -96,9 +126,16 @@ REQUIRED_SCOPES = (
 
 # TODO(connormccoy): Make table parameters configurable.
 COLUMN_FAMILY = 'cf'
-
-# Only used when we need to create the cluster.
-CLUSTER_SIZE = 3
+BENCHMARK_DATA = {
+    METRICS_CORE_JAR:
+        '245ba2a66a9bc710ce4db14711126e77bcb4e6d96ef7e622659280f3c90cbb5c',
+    TCNATIVE_BORINGSSL_JAR:
+        '027d87e77a08dedf2005d9333db49aa37e08d599aff64ea18da9893912bdf314'
+}
+BENCHMARK_DATA_URL = {
+    METRICS_CORE_JAR: DROPWIZARD_METRICS_CORE_URL,
+    TCNATIVE_BORINGSSL_JAR: TCNATIVE_BORINGSSL_URL
+}
 
 
 def GetConfig(user_config):
@@ -108,9 +145,13 @@ def GetConfig(user_config):
 def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
+  Args:
+    benchmark_config: Unused.
+
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
   """
+  del benchmark_config
   for resource in HBASE_CONF_FILES:
     data.ResourcePath(resource)
 
@@ -142,6 +183,7 @@ def _GetInstanceDescription(project, instance_name):
 
   Raises:
     KeyError: when the instance was not found.
+    IOError: when the list bigtable command fails.
   """
   env = {'CLOUDSDK_CORE_DISABLE_PROMPTS': '1'}
   env.update(os.environ)
@@ -165,7 +207,8 @@ def _GetInstanceDescription(project, instance_name):
 
 
 def _GetTableName():
-  return 'ycsb{0}'.format(FLAGS.run_uri)
+  return (FLAGS.google_bigtable_static_table_name or
+          'ycsb{0}'.format(FLAGS.run_uri))
 
 
 def _GetDefaultProject():
@@ -191,11 +234,20 @@ def _Install(vm):
   instance_name = (FLAGS.google_bigtable_instance_name or
                    'pkb-bigtable-{0}'.format(FLAGS.run_uri))
   hbase_lib = posixpath.join(hbase.HBASE_DIR, 'lib')
-  for url in [FLAGS.google_bigtable_hbase_jar_url, TCNATIVE_BORINGSSL_URL]:
-    jar_name = os.path.basename(url)
-    jar_path = posixpath.join(YCSB_HBASE_LIB, jar_name)
-    vm.RemoteCommand('curl -Lo {0} {1}'.format(jar_path, url))
-    vm.RemoteCommand('cp {0} {1}'.format(jar_path, hbase_lib))
+
+  preprovisioned_pkgs = [TCNATIVE_BORINGSSL_JAR]
+  if 'hbase-1.x' in FLAGS.google_bigtable_hbase_jar_url:
+    preprovisioned_pkgs.append(METRICS_CORE_JAR)
+  vm.InstallPreprovisionedBenchmarkData(
+      BENCHMARK_NAME, preprovisioned_pkgs, YCSB_HBASE_LIB)
+  vm.InstallPreprovisionedBenchmarkData(
+      BENCHMARK_NAME, preprovisioned_pkgs, hbase_lib)
+
+  url = FLAGS.google_bigtable_hbase_jar_url
+  jar_name = os.path.basename(url)
+  jar_path = posixpath.join(YCSB_HBASE_LIB, jar_name)
+  vm.RemoteCommand('curl -Lo {0} {1}'.format(jar_path, url))
+  vm.RemoteCommand('cp {0} {1}'.format(jar_path, hbase_lib))
 
   vm.RemoteCommand('echo "export JAVA_HOME=/usr" >> {0}/hbase-env.sh'.format(
       hbase.HBASE_CONF_DIR))
@@ -218,6 +270,88 @@ def _Install(vm):
       vm.RemoteCopy(file_path, remote_path)
 
 
+def MaxWithDefault(iterable, key, default):
+  """Equivalent to max on python 3.4 or later."""
+  try:
+    return max(iterable, key=key)
+  except ValueError:
+    return default
+
+
+def _GetCpuUtilizationSample(samples, instance_id):
+  """Gets a list of cpu utilization samples - one per cluster.
+
+  Note that the utilization only covers the run stage.
+
+  Args:
+    samples: list of sample.Sample. Used to find the load and run samples for
+             computing the run time.
+    instance_id: the bigtable instance id.
+
+  Returns:
+    a sample describing the runtime
+
+  Raises:
+    Exception:  if the time for running can not be found or if
+                querying the cpu sampling fails.
+  """
+  load_sample = MaxWithDefault(
+      (cur_sample for cur_sample in samples
+       if cur_sample.metadata.get('stage') == 'load'),
+      key=lambda sample: sample.timestamp,
+      default=None)
+
+  # get the last sample recorded in the run stage
+  last_run_sample = MaxWithDefault(
+      (cur_sample for cur_sample in samples
+       if cur_sample.metadata.get('stage') == 'run'),
+      key=lambda sample: sample.timestamp,
+      default=None)
+
+  if not load_sample or not last_run_sample:
+    raise Exception('Could not find the load or run sample, '
+                    'so cant get the time for cpu utilization')
+
+  # pylint: disable=g-import-not-at-top
+  from google.cloud import monitoring_v3
+  from google.cloud.monitoring_v3 import query
+
+  # Query the cpu utilization, which are gauged values at each minute in the
+  # time window.
+  client = monitoring_v3.MetricServiceClient()
+  start_timestamp = load_sample.timestamp
+  end_timestamp = last_run_sample.timestamp
+  samples = []
+  for metric in ['cpu_load', 'cpu_load_hottest_node']:
+    cpu_query = query.Query(
+        client, project=(FLAGS.project or _GetDefaultProject()),
+        metric_type='bigtable.googleapis.com/cluster/{}'.format(metric),
+        end_time=datetime.datetime.utcfromtimestamp(end_timestamp),
+        minutes=int((end_timestamp - start_timestamp) / 60))
+    cpu_query = cpu_query.select_resources(instance=instance_id)
+    time_series = list(cpu_query)
+    if not time_series:
+      raise Exception(
+          'Time series for computing {} could not be found.'.format(metric))
+
+    # Build the dict to be added to samples.
+    for cluster_number, cluster_time_series in enumerate(time_series):
+      utilization = [
+          round(point.value.double_value, 3)
+          for point in cluster_time_series.points]
+
+      metadata = {
+          'cluster_number': cluster_number,
+          'cpu_utilization_per_minute': utilization,
+      }
+
+      cpu_utilization_sample = sample.Sample(
+          '{}_array'.format(metric), -1, metric, metadata)
+
+      samples.append(cpu_utilization_sample)
+  return samples
+
+
 def Prepare(benchmark_spec):
   """Prepare the virtual machines to run cloud bigtable.
 
@@ -227,6 +361,8 @@ def Prepare(benchmark_spec):
   """
   benchmark_spec.always_call_cleanup = True
   vms = benchmark_spec.vms
+  if FLAGS.google_bigtable_enable_table_object_sharing:
+    ycsb.SetYcsbTarUrl(YCSB_BIGTABLE_TABLE_SHARING_TAR_URL)
 
   # TODO: in the future, it might be nice to change this so that
   # a gcp_bigtable.GcpBigtableInstance can be created with an
@@ -236,20 +372,19 @@ def Prepare(benchmark_spec):
     instance_name = 'pkb-bigtable-{0}'.format(FLAGS.run_uri)
     project = FLAGS.project or _GetDefaultProject()
     logging.info('Creating bigtable instance %s', instance_name)
-    zone = FLAGS.google_bigtable_zone_name
+    zone = FLAGS.google_bigtable_zone
     benchmark_spec.bigtable_instance = gcp_bigtable.GcpBigtableInstance(
-        instance_name, CLUSTER_SIZE, project, zone)
+        instance_name, project, zone)
     benchmark_spec.bigtable_instance.Create()
     instance = _GetInstanceDescription(project, instance_name)
     logging.info('Instance %s created successfully', instance)
 
   vm_util.RunThreaded(_Install, vms)
 
-  # Create table
-  hbase_ycsb.CreateYCSBTable(vms[0], table_name=_GetTableName(),
-                             use_snappy=False, limit_filesize=False)
-
   table_name = _GetTableName()
+  # If the table already exists, it will be an no-op.
+  hbase_ycsb.CreateYCSBTable(vms[0], table_name=table_name, use_snappy=False,
+                             limit_filesize=False)
 
   # Add hbase conf dir to the classpath.
   ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
@@ -280,8 +415,12 @@ def Run(benchmark_spec):
   instance_info = _GetInstanceDescription(
       FLAGS.project or _GetDefaultProject(), instance_name)
 
-  metadata = {'ycsb_client_vms': len(vms),
-              'bigtable_nodes': instance_info.get('serveNodes')}
+  metadata = {
+      'ycsb_client_vms': len(vms),
+      'bigtable_zone': instance_info.get('location').split('/')[-1],
+      'bigtable_storage_type': instance_info.get('defaultStorageType'),
+      'bigtable_node_count': instance_info.get('serveNodes')
+  }
 
   # By default YCSB uses a BufferedMutator for Puts / Deletes.
   # This leads to incorrect update latencies, since since the call returns
@@ -299,8 +438,14 @@ def Run(benchmark_spec):
     load_kwargs['threads'] = 1
   samples = list(benchmark_spec.executor.LoadAndRun(
       vms, load_kwargs=load_kwargs, run_kwargs=run_kwargs))
-  for sample in samples:
-    sample.metadata.update(metadata)
+
+  # Optionally add new samples for cluster cpu utilization.
+  if FLAGS.get_bigtable_cluster_cpu_utilization:
+    cpu_utilization_samples = _GetCpuUtilizationSample(samples, instance_name)
+    samples.extend(cpu_utilization_samples)
+
+  for current_sample in samples:
+    current_sample.metadata.update(metadata)
 
   return samples
 
@@ -312,11 +457,11 @@ def Cleanup(benchmark_spec):
     benchmark_spec: The benchmark specification. Contains all data that is
         required to run the benchmark.
   """
- # Delete table
+  # Delete table
   if FLAGS.google_bigtable_instance_name is None:
     benchmark_spec.bigtable_instance.Delete()
-  else:
-    # Only need to drop the tables if we're not deleting the instance.
+  elif FLAGS.google_bigtable_static_table_name is None:
+    # Only need to drop the temporary tables if we're not deleting the instance.
     vm = benchmark_spec.vms[0]
     command = ("""echo 'disable "{0}"; drop "{0}"; exit' | """
                """{1}/hbase shell""").format(_GetTableName(), hbase.HBASE_BIN)

@@ -1,4 +1,4 @@
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import mock
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import context
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import flags
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.aws import aws_disk
 from perfkitbenchmarker.providers.aws import aws_virtual_machine
@@ -27,20 +29,27 @@ from perfkitbenchmarker.providers.azure import azure_disk
 from perfkitbenchmarker.providers.azure import azure_virtual_machine
 from perfkitbenchmarker.providers.azure import flags as azure_flags
 from perfkitbenchmarker.providers.gcp import gce_disk
-from tests import mock_flags
+from tests import pkb_common_test_case
 
+FLAGS = flags.FLAGS
 
 _BENCHMARK_NAME = 'name'
 _BENCHMARK_UID = 'uid'
 _COMPONENT = 'test_component'
 
 
-class _DiskMetadataTestCase(unittest.TestCase):
+class _DiskMetadataTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
+    super(_DiskMetadataTestCase, self).setUp()
     self.addCleanup(context.SetThreadBenchmarkSpec, None)
+
+    p = mock.patch(vm_util.__name__ + '.GetTempDir', return_value='/tmp/dir')
+    p.start()
+    self.addCleanup(p.stop)
+
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
-        _BENCHMARK_NAME, flag_values=mock_flags.MockFlags(), vm_groups={})
+        _BENCHMARK_NAME, flag_values=FLAGS, vm_groups={})
     self.benchmark_spec = benchmark_spec.BenchmarkSpec(
         mock.MagicMock(), config_spec, _BENCHMARK_UID)
 
@@ -97,30 +106,29 @@ class AzureDiskMetadataTest(_DiskMetadataTestCase):
                       goal_media, goal_replication,
                       goal_host_caching, disk_size=2,
                       goal_size=2, goal_stripes=1):
-    with mock.patch(azure_disk.__name__ + '.FLAGS') as disk_flags:
-      disk_flags.azure_storage_type = storage_type
-      disk_flags.azure_host_caching = goal_host_caching
-      disk_spec = disk.BaseDiskSpec(_COMPONENT, disk_size=disk_size,
-                                    disk_type=disk_type,
-                                    num_striped_disks=goal_stripes)
+    FLAGS.azure_storage_type = storage_type
+    FLAGS.azure_host_caching = goal_host_caching
+    disk_spec = disk.BaseDiskSpec(_COMPONENT, disk_size=disk_size,
+                                  disk_type=disk_type,
+                                  num_striped_disks=goal_stripes)
 
-      vm_spec = azure_virtual_machine.AzureVmSpec(
-          'test_vm_spec.AZURE', zone='East US 2', machine_type=machine_type)
-      vm = azure_virtual_machine.DebianBasedAzureVirtualMachine(
-          vm_spec)
+    vm_spec = azure_virtual_machine.AzureVmSpec(
+        'test_vm_spec.AZURE', zone='eastus2', machine_type=machine_type)
+    vm = azure_virtual_machine.DebianBasedAzureVirtualMachine(
+        vm_spec)
 
-      azure_disk.AzureDisk.Create = mock.Mock()
-      azure_disk.AzureDisk.Attach = mock.Mock()
-      vm.StripeDisks = mock.Mock()
-      vm.CreateScratchDisk(disk_spec)
+    azure_disk.AzureDisk.Create = mock.Mock()
+    azure_disk.AzureDisk.Attach = mock.Mock()
+    vm.StripeDisks = mock.Mock()
+    vm.CreateScratchDisk(disk_spec)
 
-      expected = {disk.MEDIA: goal_media,
-                  disk.REPLICATION: goal_replication,
-                  'num_stripes': goal_stripes,
-                  'size': goal_size}
-      if goal_host_caching:
-        expected[azure_disk.HOST_CACHING] = goal_host_caching
-      self.assertDictContainsSubset(expected, vm.scratch_disks[0].metadata)
+    expected = {disk.MEDIA: goal_media,
+                disk.REPLICATION: goal_replication,
+                'num_stripes': goal_stripes,
+                'size': goal_size}
+    if goal_host_caching:
+      expected[azure_disk.HOST_CACHING] = goal_host_caching
+    self.assertDictContainsSubset(expected, vm.scratch_disks[0].metadata)
 
   def testPremiumStorage(self):
     self.DoAzureDiskTest(azure_flags.PLRS,

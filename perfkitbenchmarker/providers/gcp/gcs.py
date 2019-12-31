@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Contains classes/functions related to Google Cloud Storage."""
+
 import logging
+import posixpath
 import re
 
 from perfkitbenchmarker import errors
@@ -28,7 +31,7 @@ flags.DEFINE_string('google_cloud_sdk_version', None,
 
 FLAGS = flags.FLAGS
 
-GCS_CREDENTIAL_LOCATION = '.config/gcloud/credentials'
+_DEFAULT_GCP_SERVICE_KEY_FILE = 'gcp_credentials.json'
 DEFAULT_GCP_REGION = 'us-central1'
 GCLOUD_CONFIG_PATH = '.config/gcloud'
 
@@ -41,7 +44,7 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
   def PrepareService(self, location):
     self.location = location or DEFAULT_GCP_REGION
 
-  def MakeBucket(self, bucket):
+  def MakeBucket(self, bucket, raise_on_failure=True):
     command = ['gsutil', 'mb']
     if self.location:
       command.extend(['-l', self.location])
@@ -50,9 +53,22 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
       command.extend(['-c', 'regional'])
     elif FLAGS.object_storage_storage_class is not None:
       command.extend(['-c', FLAGS.object_storage_storage_class])
+    if FLAGS.project:
+      command.extend(['-p', FLAGS.project])
     command.extend(['gs://%s' % bucket])
 
-    vm_util.IssueCommand(command)
+    _, stderr, ret_code = vm_util.IssueCommand(command, raise_on_failure=False)
+    if ret_code and raise_on_failure:
+      raise errors.Benchmarks.BucketCreationError(stderr)
+
+  def Copy(self, src_url, dst_url):
+    """See base class."""
+    vm_util.IssueCommand(['gsutil', 'cp', src_url, dst_url])
+
+  def List(self, buckets):
+    """See base class."""
+    stdout, _, _ = vm_util.IssueCommand(['gsutil', 'ls', buckets])
+    return stdout
 
   @vm_util.Retry()
   def DeleteBucket(self, bucket):
@@ -70,9 +86,23 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
          'gs://%s' % bucket])
 
   def EmptyBucket(self, bucket):
+    # Ignore failures here and retry in DeleteBucket.  See more comments there.
     vm_util.IssueCommand(
         ['gsutil', '-m', 'rm', '-r',
-         'gs://%s/*' % bucket])
+         'gs://%s/*' % bucket], raise_on_failure=False)
+
+  def ChmodBucket(self, account, access, bucket):
+    """Updates access control lists.
+
+    Args:
+      account: string, the user to be granted.
+      access: string, the permission to be granted.
+      bucket: string, the name of the bucket to change
+    """
+    vm_util.IssueCommand([
+        'gsutil', 'acl', 'ch', '-u',
+        '{account}:{access}'.format(account=account, access=access),
+        'gs://{}'.format(bucket)])
 
   def PrepareVM(self, vm):
     vm.Install('wget')
@@ -97,8 +127,24 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
                      '--bash-completion=true')
 
     vm.RemoteCommand('mkdir -p .config')
-    vm.PushFile(object_storage_service.FindBotoFile(),
-                object_storage_service.DEFAULT_BOTO_LOCATION)
+    boto_file = object_storage_service.FindBotoFile()
+    vm.PushFile(boto_file, object_storage_service.DEFAULT_BOTO_LOCATION)
+
+    # If the boto file specifies a service key file, copy that service key file
+    # to the VM and modify the .boto file on the VM to point to the copied file.
+    with open(boto_file) as f:
+      boto_contents = f.read()
+    match = re.search(r'gs_service_key_file\s*=\s*(.*)', boto_contents)
+    if match:
+      service_key_file = match.group(1)
+      vm.PushFile(service_key_file, _DEFAULT_GCP_SERVICE_KEY_FILE)
+      vm_pwd, _ = vm.RemoteCommand('pwd')
+      vm.RemoteCommand(
+          'sed -i '
+          '-e "s/^gs_service_key_file.*/gs_service_key_file = %s/" %s' % (
+              re.escape(posixpath.join(vm_pwd.strip(),
+                                       _DEFAULT_GCP_SERVICE_KEY_FILE)),
+              object_storage_service.DEFAULT_BOTO_LOCATION))
 
     vm.gsutil_path, _ = vm.RemoteCommand('which gsutil', login_shell=True)
     vm.gsutil_path = vm.gsutil_path.split()[0]
@@ -109,7 +155,7 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
     logging.info('gsutil version -l raw result is %s', raw_result)
     search_string = 'compiled crcmod: True'
     result_string = re.findall(search_string, raw_result)
-    if len(result_string) == 0:
+    if not result_string:
       logging.info('compiled crcmod is not available, installing now...')
       try:
         # Try uninstall first just in case there is a pure python version of
@@ -120,7 +166,6 @@ class GoogleCloudStorageService(object_storage_service.ObjectStorageService):
       except errors.VirtualMachine.RemoteCommandError:
         logging.info('pip uninstall crcmod failed, could be normal if crcmod '
                      'is not available at all.')
-        pass
       vm.Install('crcmod')
       vm.installed_crcmod = True
     else:

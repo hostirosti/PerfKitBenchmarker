@@ -57,7 +57,8 @@ beam_integration_benchmark:
 """
 
 DEFAULT_JAVA_IT_CLASS = 'org.apache.beam.examples.WordCountIT'
-DEFAULT_PYTHON_IT_MODULE = 'apache_beam.examples.wordcount_it_test'
+DEFAULT_PYTHON_IT_MODULE = ('apache_beam.examples.wordcount_it_test:'
+                            'WordCountIT.test_wordcount_it')
 
 flags.DEFINE_string('beam_it_class', None, 'Path to IT class')
 flags.DEFINE_string('beam_it_args', None, 'Args to provide to the IT.'
@@ -153,10 +154,11 @@ def Run(benchmark_spec):
   metadata = copy.copy(dpb_service_instance.GetMetadata())
 
   start = datetime.datetime.now()
-  dpb_service_instance.SubmitJob('', classname,
-                                 job_arguments=job_arguments,
-                                 job_stdout_file=stdout_file,
-                                 job_type=job_type)
+  dpb_service_instance.SubmitJob(
+      classname=classname,
+      job_arguments=job_arguments,
+      job_stdout_file=stdout_file,
+      job_type=job_type)
   end_time = datetime.datetime.now()
   run_time = (end_time - start).total_seconds()
   results.append(sample.Sample('run_time', run_time, 'seconds', metadata))

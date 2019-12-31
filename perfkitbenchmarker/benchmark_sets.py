@@ -14,14 +14,23 @@
 
 """Benchmark set specific functions and definitions."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import collections
 import copy
 import itertools
 
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import linux_benchmarks
+from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import windows_benchmarks
+from perfkitbenchmarker import windows_packages
+import six
+from six.moves import zip
 
 FLAGS = flags.FLAGS
 
@@ -29,6 +38,8 @@ flags.DEFINE_string('flag_matrix', None,
                     'The name of the flag matrix to run.')
 flags.DEFINE_string('flag_zip', None,
                     'The name of the flag zip to run.')
+flags.DEFINE_integer('num_benchmark_copies', 1,
+                     'The number of copies of each benchmark config to run.')
 
 MESSAGE = 'message'
 BENCHMARK_LIST = 'benchmark_list'
@@ -77,7 +88,8 @@ BENCHMARK_SETS = {
         BENCHMARK_LIST: [STANDARD_SET]
     },
     'centurylinkcloud_set': {
-        MESSAGE: 'This benchmark set is supported on CenturyLink Cloud.',
+        MESSAGE:
+            'This benchmark set is supported on CenturyLink Cloud.',
         BENCHMARK_LIST: [
             'cassandra_stress',
             'copy_throughput',
@@ -120,10 +132,13 @@ BENCHMARK_SETS = {
             'fio',
             'gpu_pcie_bandwidth',
             'hadoop_terasort',
+            'horovod',
             'hpcc',
             'hpcg',
+            'inception3',
             'iperf',
             'mesh_network',
+            'mlperf',
             'mnist',
             'mongodb_ycsb',
             'multichase',
@@ -134,16 +149,19 @@ BENCHMARK_SETS = {
             'pgbench',
             'ping',
             'redis_ycsb',
+            'resnet',
             'stencil2d',
             'speccpu2006',
             'sysbench',
             'tensorflow',
+            'tensorflow_serving',
             'tomcat_wrk',
             'unixbench',
         ]
     },
     'intel_set': {
-        MESSAGE: 'Intel benchmark set.',
+        MESSAGE:
+            'Intel benchmark set.',
         BENCHMARK_LIST: [
             'fio',
             'iperf',
@@ -157,7 +175,8 @@ BENCHMARK_SETS = {
         ]
     },
     'kubernetes_set': {
-        MESSAGE: 'Kubernetes benchmark set.',
+        MESSAGE:
+            'Kubernetes benchmark set.',
         BENCHMARK_LIST: [
             'block_storage_workload',
             'cassandra_ycsb',
@@ -185,7 +204,8 @@ BENCHMARK_SETS = {
         BENCHMARK_LIST: [STANDARD_SET]
     },
     'rackspace_set': {
-        MESSAGE: 'Rackspace benchmark set.',
+        MESSAGE:
+            'Rackspace benchmark set.',
         BENCHMARK_LIST: [
             'aerospike',
             'block_storage_workload',
@@ -227,7 +247,8 @@ BENCHMARK_SETS = {
         BENCHMARK_LIST: [STANDARD_SET, 'silo']
     },
     'cloudsuite_set': {
-        MESSAGE: 'CloudSuite benchmark set.',
+        MESSAGE:
+            'CloudSuite benchmark set.',
         BENCHMARK_LIST: [
             'cloudsuite_data_analytics',
             'cloudsuite_data_caching',
@@ -251,9 +272,16 @@ class FlagZipNotFoundException(Exception):
 
 def _GetValidBenchmarks():
   """Returns a dict mapping valid benchmark names to their modules."""
-  if FLAGS.os_type == os_types.WINDOWS:
+  if FLAGS.os_type in os_types.WINDOWS_OS_TYPES:
     return windows_benchmarks.VALID_BENCHMARKS
   return linux_benchmarks.VALID_BENCHMARKS
+
+
+def _GetValidPackages():
+  """Returns a dict mapping valid package names to their modules."""
+  if FLAGS.os_type in os_types.WINDOWS_OS_TYPES:
+    return windows_packages.PACKAGES
+  return linux_packages.PACKAGES
 
 
 def BenchmarkModule(benchmark_name):
@@ -267,6 +295,19 @@ def BenchmarkModule(benchmark_name):
   """
   valid_benchmarks = _GetValidBenchmarks()
   return valid_benchmarks.get(benchmark_name)
+
+
+def PackageModule(package_name):
+  """Finds the module for a package by name.
+
+  Args:
+    package_name: The name of the package.
+
+  Returns:
+    The package's module, or None if the package_name is invalid.
+  """
+  packages = _GetValidPackages()
+  return packages.get(package_name)
 
 
 def _GetBenchmarksFromUserConfig(user_config):
@@ -304,7 +345,6 @@ def _AssertZipAxesHaveSameLength(axes):
       raise ValueError('flag_zip axes must all be the same length')
 
 
-
 def _AssertFlagMatrixAndZipDefsExist(benchmark_config,
                                      flag_matrix_name,
                                      flag_zip_name):
@@ -321,9 +361,9 @@ def _AssertFlagMatrixAndZipDefsExist(benchmark_config,
       specified in the benchmark_config, or None.
 
   Raises:
-    FlagMatrixNotFoundException if flag_matrix_name is not None, and is not
+    FlagMatrixNotFoundException: if flag_matrix_name is not None, and is not
       found in the flag_matrix_defs section of the benchmark_config.
-    FlagZipNotFoundException if flag_zip_name is not None, and is not
+    FlagZipNotFoundException: if flag_zip_name is not None, and is not
       found in the flag_zip_defs section of the benchmark_config.
   """
   if (flag_matrix_name and
@@ -344,33 +384,28 @@ def GetBenchmarksFromFlags():
   If no benchmarks (or sets) are specified, this will return the standard set.
   If multiple sets or mixes of sets and benchmarks are specified, this will
   return the union of all sets and individual benchmarks.
+
+  Raises:
+    ValueError: when benchmark_name is not valid for os_type supplied
   """
   user_config = configs.GetUserConfig()
   benchmark_config_list = _GetBenchmarksFromUserConfig(user_config)
   if benchmark_config_list and not FLAGS['benchmarks'].present:
     return benchmark_config_list
 
-  benchmark_names = set()
-  for benchmark in FLAGS.benchmarks:
-    if benchmark in BENCHMARK_SETS:
-      benchmark_names |= set(BENCHMARK_SETS[benchmark][BENCHMARK_LIST])
-    else:
-      benchmark_names.add(benchmark)
+  benchmark_queue = collections.deque(FLAGS.benchmarks)
+  benchmark_names = []
+  benchmark_set = set()
 
-  # Expand recursive sets
-  expanded = set()
-  did_expansion = True
-  while did_expansion:
-    did_expansion = False
-    for benchmark_name in benchmark_names:
-      if (benchmark_name in BENCHMARK_SETS):
-        did_expansion = True
-        benchmark_names.remove(benchmark_name)
-        if (benchmark_name not in expanded):
-            expanded.add(benchmark_name)
-            benchmark_names |= set(BENCHMARK_SETS[
-                benchmark_name][BENCHMARK_LIST])
-        break
+  while benchmark_queue:
+    benchmark = benchmark_queue.popleft()
+    if benchmark in benchmark_set:
+      continue
+    benchmark_set.add(benchmark)
+    if benchmark in BENCHMARK_SETS:
+      benchmark_queue.extendleft(BENCHMARK_SETS[benchmark][BENCHMARK_LIST])
+    else:
+      benchmark_names.append(benchmark)
 
   valid_benchmarks = _GetValidBenchmarks()
 
@@ -413,26 +448,28 @@ def GetBenchmarksFromFlags():
     crossed_axes = []
     if flag_zip:
       flag_axes = []
-      for flag, values in flag_zip.iteritems():
+      for flag, values in six.iteritems(flag_zip):
         flag_axes.append([{flag: v} for v in values])
 
       _AssertZipAxesHaveSameLength(flag_axes)
 
-      for flag_config in itertools.izip(*flag_axes):
+      for flag_config in zip(*flag_axes):
         config = _GetConfigForAxis(benchmark_config, flag_config)
         zipped_axes.append((benchmark_module, config))
 
       crossed_axes.append([benchmark_tuple[1]['flags'] for
                            benchmark_tuple in zipped_axes])
 
-    for flag, values in flag_matrix.iteritems():
+    for flag, values in sorted(six.iteritems(flag_matrix)):
       crossed_axes.append([{flag: v} for v in values])
 
     for flag_config in itertools.product(*crossed_axes):
       config = _GetConfigForAxis(benchmark_config, flag_config)
       if (flag_matrix_filter and not eval(
           flag_matrix_filter, {}, config['flags'])):
-          continue
-      benchmark_config_list.append((benchmark_module, config))
+        continue
+
+      benchmark_config_list.extend([(benchmark_module, config)] *
+                                   FLAGS.num_benchmark_copies)
 
   return benchmark_config_list

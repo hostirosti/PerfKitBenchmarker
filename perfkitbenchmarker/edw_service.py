@@ -17,7 +17,10 @@
 Classes to wrap specific backend services are in the corresponding provider
 directory as a subclass of BaseEdwService.
 """
+import json
+import os
 
+from perfkitbenchmarker import data
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import resource
 
@@ -39,17 +42,29 @@ flags.DEFINE_string('edw_service_cluster_user', None,
 flags.DEFINE_string('edw_service_cluster_password', None,
                     'If set, the password authorized on cluster (only '
                     'applicable when using snapshots).')
-flags.DEFINE_enum('edw_query_execution_mode', 'sequential', ['sequential',
-                                                             'concurrent'],
-                  'The mode for executing the queries on the edw cluster.')
 
 FLAGS = flags.FLAGS
 
 
-TYPE_2_PROVIDER = dict([('redshift', 'aws')])
-TYPE_2_MODULE = dict([('redshift',
-                       'perfkitbenchmarker.providers.aws.redshift')])
-DEFAULT_NUMBER_OF_NODES = 2
+TYPE_2_PROVIDER = dict([('athena', 'aws'),
+                        ('redshift', 'aws'),
+                        ('spectrum', 'aws'),
+                        ('bigquery', 'gcp'),
+                        ('azuresqldatawarehouse', 'azure')])
+TYPE_2_MODULE = dict([('athena',
+                       'perfkitbenchmarker.providers.aws.athena'),
+                      ('redshift',
+                       'perfkitbenchmarker.providers.aws.redshift'),
+                      ('spectrum',
+                       'perfkitbenchmarker.providers.aws.spectrum'),
+                      ('bigquery',
+                       'perfkitbenchmarker.providers.gcp.bigquery'),
+                      ('azuresqldatawarehouse',
+                       'perfkitbenchmarker.providers.azure.'
+                       'azure_sql_data_warehouse')])
+DEFAULT_NUMBER_OF_NODES = 1
+# The order of stages is important to the successful lifecycle completion.
+EDW_SERVICE_LIFECYCLE_STAGES = ['create', 'load', 'query', 'delete']
 
 
 class EdwService(resource.BaseResource):
@@ -80,7 +95,11 @@ class EdwService(resource.BaseResource):
     # Cluster related attributes
     self.concurrency = edw_service_spec.concurrency
     self.node_type = edw_service_spec.node_type
-    self.node_count = edw_service_spec.node_count
+
+    if edw_service_spec.node_count:
+      self.node_count = edw_service_spec.node_count
+    else:
+      self.node_count = DEFAULT_NUMBER_OF_NODES
 
     # Interaction related attributes
     if edw_service_spec.endpoint:
@@ -95,12 +114,131 @@ class EdwService(resource.BaseResource):
     # resource workflow management
     self.supports_wait_on_delete = True
 
-
   def GetMetadata(self):
     """Return a dictionary of the metadata for this edw service."""
     basic_data = {'edw_service_type': self.spec.type,
                   'edw_cluster_identifier': self.cluster_identifier,
                   'edw_cluster_node_type': self.node_type,
-                  'edw_cluster_node_count': self.node_count
-                  }
+                  'edw_cluster_node_count': self.node_count}
     return basic_data
+
+  def RunCommandHelper(self):
+    """Returns EDW instance specific launch command components.
+
+    Returns:
+      A string with additional command components needed when invoking script
+      runner.
+    """
+    raise NotImplementedError
+
+  def InstallAndAuthenticateRunner(self, vm):
+    """Method to perform installation and authentication of runner utilities.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    raise NotImplementedError
+
+  def PrepareClientVm(self, vm):
+    """Prepare phase to install the runtime environment on the client vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    vm.Install('pip')
+    vm.RemoteCommand('sudo pip install absl-py')
+
+  def PushDataDefinitionDataManipulationScripts(self, vm):
+    """Method to push the database bootstrap and teardown scripts to the vm.
+
+    Args:
+      vm: Client vm on which the scripts will be run.
+    """
+    raise NotImplementedError
+
+  def PushScriptExecutionFramework(self, vm):
+    """Method to push the runner to execute sql scripts on the vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+    """
+    # Push generic runner
+    vm.PushFile(data.ResourcePath(os.path.join('edw', 'script_driver.py')))
+
+  def GenerateLifecycleStageScriptName(self, lifecycle_stage):
+    """Computes the default name for script implementing an edw lifecycle stage.
+
+    Args:
+      lifecycle_stage: Stage for which the corresponding sql script is desired.
+
+    Returns:
+      script name for implementing the argument lifecycle_stage.
+    """
+    return os.path.basename(
+        os.path.normpath('database_%s.sql' % lifecycle_stage))
+
+  def GenerateScriptExecutionCommand(self, script):
+    """Method to generate the command for running the sql script on the vm.
+
+    Args:
+      script: Script to execute on the client vm.
+
+    Returns:
+      base command components to run the sql script on the vm.
+    """
+    return ['python', 'script_driver.py', '--script={}'.format(script)]
+
+  def GetScriptExecutionResults(self, script_name, client_vm):
+    """A function to trigger single/multi script execution and return performance.
+
+    Args:
+      script_name: Script to execute on the client vm.
+      client_vm: Client vm on which the script will be executed.
+
+    Returns:
+      A tuple of script execution performance results.
+      - latency of executing the script.
+      - reference job_id executed on the edw_service.
+    """
+    script_execution_command = self.GenerateScriptExecutionCommand(script_name)
+    stdout, _ = client_vm.RemoteCommand(script_execution_command)
+    all_script_performance = json.loads(stdout)
+    script_performance = all_script_performance[script_name]
+    return script_performance['execution_time'], script_performance['job_id']
+
+  @classmethod
+  def RunScriptOnClientVm(cls, vm, database, script):
+    """A function to execute the script on the client vm.
+
+    Args:
+      vm: Client vm on which the script will be run.
+      database: The database within which the query executes.
+      script: Named query to execute (expected to be on the client vm).
+
+    Returns:
+      A dictionary with the execution performance results that includes
+      execution status and the latency of executing the script.
+    """
+    raise NotImplementedError
+
+  def GetDatasetLastUpdatedTime(self, dataset=None):
+    """Get the formatted last modified timestamp of the dataset."""
+    raise NotImplementedError
+
+  def ExtractDataset(self,
+                     dest_bucket,
+                     dataset=None,
+                     tables=None,
+                     dest_format='CSV'):
+    """Extract all tables in a dataset to object storage.
+
+    Args:
+      dest_bucket: Name of the bucket to extract the data to. Should already
+        exist.
+      dataset: Optional name of the dataset. If none, will be extracted from the
+        cluster_identifier.
+      tables: Optional list of table names to extract. If none, all tables in
+        the dataset will be extracted.
+      dest_format: Format to extract data in.
+    """
+    raise NotImplementedError

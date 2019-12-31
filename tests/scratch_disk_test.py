@@ -1,4 +1,4 @@
-# Copyright 2014 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,15 +16,16 @@
 
 import abc
 import unittest
+from absl.testing import flagsaver
 import mock
 
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import context
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import flags
 from perfkitbenchmarker import linux_virtual_machine
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker import providers
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.aws import aws_disk
 from perfkitbenchmarker.providers.aws import aws_virtual_machine
@@ -34,8 +35,9 @@ from perfkitbenchmarker.providers.azure import azure_virtual_machine
 from perfkitbenchmarker.providers.gcp import gce_disk
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from perfkitbenchmarker.providers.gcp import util
-from tests import mock_flags
+from tests import pkb_common_test_case  # pylint:disable=unused-import
 
+FLAGS = flags.FLAGS
 
 _BENCHMARK_NAME = 'name'
 _BENCHMARK_UID = 'uid'
@@ -61,9 +63,7 @@ class ScratchDiskTestMixin(object):
     pass
 
   def setUp(self):
-    mocked_flags = mock_flags.PatchTestCaseFlags(self)
-    mocked_flags.cloud = providers.GCP
-    mocked_flags.os_type = os_types.DEBIAN
+    self.saved_flag_values = flagsaver.save_flag_values()
     self.patches = []
 
     vm_prefix = linux_virtual_machine.__name__ + '.BaseLinuxMixin'
@@ -77,6 +77,8 @@ class ScratchDiskTestMixin(object):
     # Patch subprocess.Popen to make sure we don't issue any commands to spin up
     # resources.
     self.patches.append(mock.patch('subprocess.Popen'))
+    self.patches.append(
+        mock.patch(vm_util.__name__ + '.GetTempDir', return_value='/tmp/dir'))
 
     self._PatchCloudSpecific()
 
@@ -91,10 +93,11 @@ class ScratchDiskTestMixin(object):
 
     # VM Creation depends on there being a BenchmarkSpec.
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
-        _BENCHMARK_NAME, flag_values=mocked_flags, vm_groups={})
+        _BENCHMARK_NAME, flag_values=FLAGS, vm_groups={})
     self.spec = benchmark_spec.BenchmarkSpec(mock.MagicMock(), config_spec,
                                              _BENCHMARK_UID)
     self.addCleanup(context.SetThreadBenchmarkSpec, None)
+    self.addCleanup(flagsaver.restore_flag_values, self.saved_flag_values)
 
   def testScratchDisks(self):
     """Test for creating and deleting scratch disks.
@@ -113,9 +116,10 @@ class ScratchDiskTestMixin(object):
     scratch_disk = vm.scratch_disks[0]
 
     scratch_disk.Create.assert_called_once_with()
-    vm.FormatDisk.assert_called_once_with(scratch_disk.GetDevicePath())
+    vm.FormatDisk.assert_called_once_with(scratch_disk.GetDevicePath(), None)
     vm.MountDisk.assert_called_once_with(
-        scratch_disk.GetDevicePath(), '/mountpoint0')
+        scratch_disk.GetDevicePath(), '/mountpoint0',
+        None, scratch_disk.mount_options, scratch_disk.fstab_options)
 
     disk_spec = disk.BaseDiskSpec(_COMPONENT, mount_point='/mountpoint1')
     vm.CreateScratchDisk(disk_spec)
@@ -133,9 +137,10 @@ class ScratchDiskTestMixin(object):
     scratch_disk = vm.scratch_disks[1]
 
     scratch_disk.Create.assert_called_once_with()
-    vm.FormatDisk.assert_called_with(scratch_disk.GetDevicePath())
+    vm.FormatDisk.assert_called_with(scratch_disk.GetDevicePath(), None)
     vm.MountDisk.assert_called_with(
-        scratch_disk.GetDevicePath(), '/mountpoint1')
+        scratch_disk.GetDevicePath(), '/mountpoint1',
+        None, scratch_disk.mount_options, scratch_disk.fstab_options)
 
     vm.DeleteScratchDisks()
 
@@ -150,7 +155,7 @@ class AzureScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
 
   def _CreateVm(self):
     vm_spec = azure_virtual_machine.AzureVmSpec(
-        'test_vm_spec.Azure', machine_type='test_machine_type')
+        'test_vm_spec.Azure', zone='eastus2', machine_type='test_machine_type')
     return azure_virtual_machine.DebianBasedAzureVirtualMachine(vm_spec)
 
   def _GetDiskClass(self):
@@ -176,6 +181,11 @@ class AwsScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
   def _PatchCloudSpecific(self):
     self.patches.append(mock.patch(aws_disk.__name__ + '.AwsDisk'))
     self.patches.append(mock.patch(aws_util.__name__ + '.AddDefaultTags'))
+    # In Python3 the mocking of subprocess.Popen in setup() is problematic for
+    # platform.system(). It is called by RemoteCommand() in
+    # _GetNvmeBootIndex() so we'll mock that instead.
+    self.patches.append(mock.patch(
+        aws_virtual_machine.__name__ + '.AwsVirtualMachine._GetNvmeBootIndex'))
 
   def _CreateVm(self):
     vm_spec = aws_virtual_machine.AwsVmSpec('test_vm_spec.AWS',

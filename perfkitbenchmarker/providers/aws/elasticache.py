@@ -21,6 +21,7 @@ from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import memcached_server
 from perfkitbenchmarker.memcache_service import MemcacheService
 from perfkitbenchmarker.providers.aws import aws_network
+from perfkitbenchmarker.providers.aws import util
 
 
 ELASTICACHE_PORT = 11211
@@ -64,7 +65,8 @@ class ElastiCacheMemcacheService(MemcacheService):
            '--cache-cluster-id=%s' % self.cluster_id,
            '--num-cache-nodes=%s' % self.num_servers,
            '--region=%s' % self.region,
-           '--cache-node-type=%s' % self.node_type]
+           '--cache-node-type=%s' % self.node_type,
+           '--tags'] + util.MakeFormattedDefaultTags()
     vm_util.IssueCommand(cmd)
 
     # Wait for the cluster to come up
@@ -81,7 +83,7 @@ class ElastiCacheMemcacheService(MemcacheService):
     cmd = ['aws', 'elasticache', 'delete-cache-cluster',
            '--cache-cluster-id=%s' % self.cluster_id,
            '--region=%s' % self.region]
-    vm_util.IssueCommand(cmd)
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
     # Don't have to delete the subnet group. It will be deleted with the subnet.
 
   def Flush(self):

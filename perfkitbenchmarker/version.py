@@ -16,23 +16,23 @@
 
 import os.path
 import subprocess
-
-import pkg_resources
-
 import perfkitbenchmarker
+import pkg_resources
 
 
 _STATIC_VERSION_FILE = 'version.txt'
 
 
 def _GetVersion():
+  """Gets the version from git or the static version file."""
   # Try to pull the version from git.
   root_dir = os.path.dirname(os.path.dirname(__file__))
   git_dir = os.path.join(root_dir, '.git')
   try:
     version = subprocess.check_output(['git', '--git-dir', git_dir,
                                        'describe', '--always'],
-                                      stderr=subprocess.STDOUT)
+                                      stderr=subprocess.STDOUT,
+                                      universal_newlines=True)
   except (OSError, subprocess.CalledProcessError):
     # Could not get the version from git. Resort to contents of the static
     # version file.

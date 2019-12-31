@@ -1,4 +1,4 @@
-# Copyright 2014 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 """Tests for perfkitbenchmarker.vm_util."""
 
 import os
-import psutil
 import subprocess
 import threading
 import time
@@ -23,23 +22,25 @@ import unittest
 
 import mock
 
+from perfkitbenchmarker import errors
+from perfkitbenchmarker import flags
 from perfkitbenchmarker import vm_util
+from tests import pkb_common_test_case
+import psutil
+
+FLAGS = flags.FLAGS
 
 
-class ShouldRunOnInternalIpAddressTestCase(unittest.TestCase):
+class ShouldRunOnInternalIpAddressTestCase(
+    pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    p = mock.patch(vm_util.__name__ + '.FLAGS')
-    self.flags = p.start()
-    self.flags_patch = p
+    super(ShouldRunOnInternalIpAddressTestCase, self).setUp()
     self.sending_vm = mock.MagicMock()
     self.receiving_vm = mock.MagicMock()
 
-  def tearDown(self):
-    self.flags_patch.stop()
-
   def _RunTest(self, expectation, ip_addresses, is_reachable=True):
-    self.flags.ip_addresses = ip_addresses
+    FLAGS.ip_addresses = ip_addresses
     self.sending_vm.IsReachable.return_value = is_reachable
     self.assertEqual(
         expectation,
@@ -93,6 +94,7 @@ class WaitUntilSleepTimer(threading.Thread):
   TODO(klausw): If that's an issue, could add a unique fractional part
   to the sleep command args to distinguish them.
   """
+
   def __init__(self, interval, function):
     threading.Thread.__init__(self)
     self.end_time = time.time() + interval
@@ -120,15 +122,28 @@ class WaitUntilSleepTimer(threading.Thread):
     self.finished.set()
 
 
-class IssueCommandTestCase(unittest.TestCase):
+class IssueCommandTestCase(pkb_common_test_case.PkbCommonTestCase):
+
+  def setUp(self):
+    super(IssueCommandTestCase, self).setUp()
+    FLAGS.time_commands = True
 
   def testTimeoutNotReached(self):
     _, _, retcode = vm_util.IssueCommand(['sleep', '0s'])
     self.assertEqual(retcode, 0)
 
   @mock.patch('threading.Timer', new=WaitUntilSleepTimer)
+  def testTimeoutReachedThrows(self):
+    with self.assertRaises(errors.VmUtil.IssueCommandTimeoutError):
+      _, _, _ = vm_util.IssueCommand(['sleep', '2s'], timeout=1,
+                                     raise_on_failure=False)
+    self.assertFalse(HaveSleepSubprocess())
+
+  @mock.patch('threading.Timer', new=WaitUntilSleepTimer)
   def testTimeoutReached(self):
-    _, _, retcode = vm_util.IssueCommand(['sleep', '2s'], timeout=1)
+    _, _, retcode = vm_util.IssueCommand(['sleep', '2s'], timeout=1,
+                                         raise_on_failure=False,
+                                         raise_on_timeout=False)
     self.assertEqual(retcode, -9)
     self.assertFalse(HaveSleepSubprocess())
 
@@ -142,6 +157,56 @@ class IssueCommandTestCase(unittest.TestCase):
       with self.assertRaises(KeyboardInterrupt):
         vm_util.IssueCommand(['sleep', '2s'], timeout=None)
     self.assertFalse(HaveSleepSubprocess())
+
+  def testRaiseOnFailureSuppressed_NoException(self):
+    def _SuppressFailure(stdout, stderr, retcode):
+      del stdout  # unused
+      del stderr  # unused
+      self.assertNotEqual(
+          retcode, 0,
+          '_SuppressFailure should not have been called for retcode=0.')
+      return True
+
+    stdout, stderr, retcode = vm_util.IssueCommand(
+        ['cat', 'non_existent_file'],
+        suppress_failure=_SuppressFailure)
+
+    # Ideally our command would produce stdout that we could verify is preserved
+    # but that's hard with the way IssueCommand creates local files for getting
+    # results subprocess.Popen().
+    self.assertEqual(stdout, '')
+
+    # suppressed from
+    # cat: non_existent_file: No such file or directory
+    self.assertEqual(stderr, '')
+
+    # suppressed from 1
+    self.assertEqual(retcode, 0)
+
+  def testRaiseOnFailureUnsuppressed_ExceptionRaised(self):
+
+    def _DoNotSuppressFailure(stdout, stderr, retcode):
+      del stdout  # unused
+      del stderr  # unused
+      self.assertNotEqual(
+          retcode, 0,
+          '_DoNotSuppressFailure should not have been called for retcode=0.')
+      return False
+
+    with self.assertRaises(errors.VmUtil.IssueCommandError) as cm:
+      vm_util.IssueCommand(['cat', 'non_existent_file'],
+                           raise_on_failure=True,
+                           suppress_failure=_DoNotSuppressFailure)
+    self.assertIn('cat: non_existent_file: No such file or directory',
+                  str(cm.exception))
+
+  def testRaiseOnFailureWithNoSuppression_ExceptionRaised(self):
+    with self.assertRaises(errors.VmUtil.IssueCommandError) as cm:
+      vm_util.IssueCommand(['cat', 'non_existent_file'],
+                           raise_on_failure=True,
+                           suppress_failure=None)
+    self.assertIn('cat: non_existent_file: No such file or directory',
+                  str(cm.exception))
 
 
 if __name__ == '__main__':

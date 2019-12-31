@@ -26,7 +26,7 @@ from perfkitbenchmarker.linux_packages import INSTALL_DIR
 FLAGS = flags.FLAGS
 
 GIT_REPO = 'https://github.com/aerospike/aerospike-server.git'
-GIT_TAG = '3.7.5'
+GIT_TAG = '4.0.0.1'
 AEROSPIKE_DIR = '%s/aerospike-server' % INSTALL_DIR
 AEROSPIKE_CONF_PATH = '%s/as/etc/aerospike_dev.conf' % AEROSPIKE_DIR
 
@@ -49,8 +49,13 @@ def _Install(vm):
   vm.Install('lua5_1')
   vm.Install('openssl')
   vm.RemoteCommand('git clone {0} {1}'.format(GIT_REPO, AEROSPIKE_DIR))
-  vm.RemoteCommand('cd {0} && git checkout {1} && git submodule update --init '
-                   '&& make'.format(AEROSPIKE_DIR, GIT_TAG))
+  # Comment out Werror flag and compile. With newer compilers gcc7xx,
+  # compilation is broken due to warnings.
+  vm.RemoteCommand(
+      'cd {0} && git checkout {1} && git submodule update --init '
+      '&& sed -i "s/COMMON_CFLAGS += -Werror/# $COMMON_CFLAGS += -Werror/" '
+      '{0}/make_in/Makefile.in '
+      '&& make'.format(AEROSPIKE_DIR, GIT_TAG))
 
 
 def YumInstall(vm):
@@ -60,6 +65,7 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs the memtier package on the VM."""
+  vm.InstallPackages('netcat-openbsd zlib1g-dev')
   _Install(vm)
 
 

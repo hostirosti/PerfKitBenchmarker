@@ -77,16 +77,22 @@ class GcpDpbDataflow(dpb_service.BaseDpbService):
     """See base class."""
     pass
 
-  def SubmitJob(self, jarfile, classname, job_poll_interval=None,
-                job_arguments=None, job_stdout_file=None,
-                job_type=None):
+  def SubmitJob(
+      self,
+      jarfile='',
+      classname=None,
+      job_poll_interval=None,
+      job_arguments=None,
+      job_stdout_file=None,
+      job_type=None):
     """See base class."""
 
     if job_type == self.BEAM_JOB_TYPE:
       full_cmd, base_dir = beam_benchmark_helper.BuildBeamCommand(
           self.spec, classname, job_arguments)
       stdout, _, retcode = vm_util.IssueCommand(full_cmd, cwd=base_dir,
-                                                timeout=FLAGS.beam_it_timeout)
+                                                timeout=FLAGS.beam_it_timeout,
+                                                raise_on_failure=False)
       assert retcode == 0, "Integration Test Failed."
       return
 

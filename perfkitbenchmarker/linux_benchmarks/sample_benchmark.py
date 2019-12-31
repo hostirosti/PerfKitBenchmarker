@@ -1,3 +1,16 @@
+# Copyright 2018 PerfKitBenchmarker Authors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Sample benchmark.
 
 This benchmark demonstrates the use of preprovisioned data.
@@ -28,13 +41,15 @@ sample:
 # the following command:
 #   echo "1234567890" > sample_preprovisioned_data.txt
 #
-# The value in this dict is the md5sum hash for the file.
+# The value in this dict is the sha256sum hash for the file.
 #
 # The benchmark defines the constant BENCHMARK_DATA to contain the name of the
 # file (which is prepended by the benchmark name followed by an underscore)
-# mapped to the md5sum hash. This ensures that when we change versions of the
+# mapped to the sha256sum hash. This ensures that when we change versions of the
 # benchmark data or binaries, we update the code.
-BENCHMARK_DATA = {'preprovisioned_data.txt': '7c12772809c1c0c3deda6103b10fdfa0'}
+BENCHMARK_DATA = {
+    'preprovisioned_data.txt':
+        '4795a1c2517089e4df569afd77c04e949139cf299c87f012b894fccf91df4594'}
 
 
 def GetConfig(user_config):

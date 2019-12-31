@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Contains classes/functions related to Azure Blob Storage."""
+
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import object_storage_service
@@ -35,7 +38,26 @@ class AzureBlobStorageService(object_storage_service.ObjectStorageService):
   STORAGE_NAME = providers.AZURE
 
   def PrepareService(self, location,
-                     existing_storage_account_and_resource_group=None):
+                     existing_storage_account_and_resource_group=None,
+                     try_to_create_storage_account_and_resource_group=False):
+    """See base class (without additional args).
+
+    TODO(deitz): We should use the same interface across the clouds without
+    additional arguments.
+
+    Args:
+      location: where to place our data.
+      existing_storage_account_and_resource_group: An existing storage account
+          and resource group for reading objects that may have already been
+          created.
+      try_to_create_storage_account_and_resource_group: Whether to try to create
+          the storage account and resource group in case it does not exist yet.
+          This supports invoking the object_storage_service_benchmark multiple
+          times on the same bucket name and creating the resource group the
+          first time. While this defaults to False, if there is no existing
+          storage account and resource group passed to this function via
+          existing_storage_account_and_resource_group, then one will be created.
+    """
     # abs is "Azure Blob Storage"
     prefix = 'pkb%sabs' % FLAGS.run_uri
 
@@ -46,14 +68,30 @@ class AzureBlobStorageService(object_storage_service.ObjectStorageService):
           existing_storage_account_and_resource_group
       assert existing_storage_account is not None
       assert existing_resource_group is not None
+    else:
+      # We don't have an existing storage account or resource group so we better
+      # create one.
+      try_to_create_storage_account_and_resource_group = True
     storage_account_name = existing_storage_account or prefix + 'storage'
     resource_group_name = existing_resource_group or prefix + '-resource-group'
+
+    # If we have an existing storage account and resource, we typically would
+    # not try to create it. If try_to_create_storage_account_and_resource_group
+    # is True, however, then we do try to create it. In this case, we shouldn't
+    # raise on a failure since it may already exist.
+    raise_on_create_failure = not (
+        existing_storage_account_and_resource_group and
+        try_to_create_storage_account_and_resource_group)
 
     # We use a separate resource group so that our buckets can optionally stick
     # around after PKB runs. This is useful for things like cold reads tests
     self.resource_group = \
-        azure_network.AzureResourceGroup(resource_group_name,
-                                         existing_resource_group is not None)
+        azure_network.AzureResourceGroup(
+            resource_group_name,
+            use_existing=not try_to_create_storage_account_and_resource_group,
+            timeout_minutes=max(FLAGS.timeout_minutes,
+                                FLAGS.persistent_timeout_minutes),
+            raise_on_create_failure=raise_on_create_failure)
     self.resource_group.Create()
 
     # We use a different Azure storage account than the VM account
@@ -67,22 +105,35 @@ class AzureBlobStorageService(object_storage_service.ObjectStorageService):
         storage_account_name,
         kind=FLAGS.azure_blob_account_kind,
         resource_group=self.resource_group,
-        use_existing=existing_storage_account is not None)
+        use_existing=not try_to_create_storage_account_and_resource_group,
+        raise_on_create_failure=raise_on_create_failure)
     self.storage_account.Create()
 
   def CleanupService(self):
     self.storage_account.Delete()
     self.resource_group.Delete()
 
-  def MakeBucket(self, bucket):
-    vm_util.IssueRetryableCommand([
-        azure.AZURE_PATH, 'storage', 'container', 'create',
-        '--name', bucket] + self.storage_account.connection_args)
+  def MakeBucket(self, bucket, raise_on_failure=True):
+    _, stderr, ret_code = vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'storage', 'container', 'create', '--name', bucket] +
+        self.storage_account.connection_args,
+        raise_on_failure=False)
+    if ret_code and raise_on_failure:
+      raise errors.Benchmarks.BucketCreationError(stderr)
 
   def DeleteBucket(self, bucket):
-    vm_util.IssueCommand([
-        azure.AZURE_PATH, 'storage', 'container', 'delete',
-        '--name', bucket] + self.storage_account.connection_args)
+    vm_util.IssueCommand(
+        [azure.AZURE_PATH, 'storage', 'container', 'delete', '--name', bucket] +
+        self.storage_account.connection_args,
+        raise_on_failure=False)
+
+  def Copy(self, src_url, dst_url):
+    """See base class."""
+    raise NotImplementedError()
+
+  def List(self, buckets):
+    """See base class."""
+    raise NotImplementedError()
 
   def EmptyBucket(self, bucket):
     # Emptying buckets on Azure is hard. We pass for now - this will
